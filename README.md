@@ -11,7 +11,7 @@
 把这个目录放到 Claude 的 skills 目录下：
 
 ```bash
-git clone https://github.com/<your-name>/music-dl.git ~/.claude/skills/music-dl
+git clone https://github.com/p2o51/music-dl.git ~/.claude/skills/music-dl
 python3 -m pip install requests qrcode Pillow
 ```
 
