@@ -1,0 +1,21 @@
+# 运行时产生的敏感 / 无关文件，切勿提交
+.qqmusic_cookie.json
+*_cookie.json
+qq_login_qr.png
+/tmp/qq_login_qr.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 下载产物
+*.flac
+*.mp3
+*.m4a
+*.ape
+
+# macOS
+.DS_Store
