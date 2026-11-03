@@ -35,6 +35,24 @@ python3 ~/.claude/skills/music-dl/qq_dl.py song <songMid> --quality flac
 
 `<songMid>` 是 QQ 音乐内部曲目 ID，一般不会提前知道，通常先用 `search` 拿到候选再下载，这个子命令主要用于已经从搜索结果里拿到 mid 的场景。歌名、歌手会从歌曲详情里自动补全。
 
+### 下载整张专辑
+
+先按关键词搜专辑。不带 `--first` / `--index` 时**只列出结果、不下载**，不会阻塞：
+
+```bash
+python3 ~/.claude/skills/music-dl/qq_dl.py album "伊能静 关不住"
+```
+
+每行结果是 `歌手 - 专辑名 · 发行日期 · 曲目数 · albumMid`。认准是哪一张（同名专辑、单曲、翻唱合集很多，看歌手、日期和曲目数）后，用 albumMid 下载整张：
+
+```bash
+python3 ~/.claude/skills/music-dl/qq_dl.py album 0012uuSI1sJa2m --quality best
+```
+
+也可以直接 `album "关键词" --first` / `--index N`。专辑按光盘、音轨顺序下载，最后打印一行汇总：`💿 《专辑名》：✅ 新下载 N 首 · ⏭️ 已存在 N 首 · ❌ 失败 N 首`，有失败时退出码为 2。
+
+`album` 命令默认按专辑分文件夹：`专辑名/01 歌名.flac`，多碟专辑是 `专辑名/1-01 歌名.flac`。其他命令默认平铺成 `歌手 - 歌名.flac`。用 `--layout album` / `--layout flat` 可以改。
+
 ### 下载歌单
 
 ```bash
@@ -45,7 +63,11 @@ python3 ~/.claude/skills/music-dl/qq_dl.py playlist 123456 --quality flac
 
 ### 指定音质
 
-`--quality` 可选：`128`（标准 MP3）/ `320`（HQ MP3，需会员）/ `flac`（无损，需会员）/ `m4a`（默认音质）/ `ape`（无损 APE）。不写默认 `320`。
+`--quality` 可选：`128`（标准 MP3）/ `320`（HQ MP3，需会员）/ `flac`（无损，需会员）/ `m4a`（默认音质）/ `ape`（无损 APE）/ `best`。不写默认 `320`。
+
+**用户要最高音质时用 `best`**：每首歌按「无损 FLAC → 320 → 128」取第一个有音源的音质，并打印 `🎚️ 音质：…` 说明实际用了哪一档。老专辑常常没有无损版，用 `best` 不会因此失败。QQ 音乐的无损里有不少是 24 bit。更高的「臻品母带」需要超级会员，脚本不支持。
+
+指定了具体音质而这首歌没有这一档时，会打印 `⚠️ 这首歌没有无损 FLAC音源` 并跳过，不会拿别的音质顶替（旧版会把 m4a 存成 `.flac`）。
 
 拿不到下载链接时，脚本会区分两种情况：
 
@@ -63,7 +85,7 @@ python3 ~/.claude/skills/music-dl/qq_dl.py playlist 123456 --quality flac
 python3 ~/.claude/skills/music-dl/qq_dl.py search "晴天" --first --quality flac --output-dir ~/Downloads
 ```
 
-不指定时默认下载到 `~/Music/QQMusic`。文件名格式为 `歌手 - 歌曲名.扩展名`；如果目标文件已存在且非空，会跳过下载（`⏭️ 已存在`）。
+不指定时默认下载到 `~/Music/QQMusic`。文件名格式为 `歌手 - 歌曲名.扩展名`（`album` 命令是 `专辑名/01 歌名.扩展名`，见上）；如果目标文件已存在且非空，会跳过下载（`⏭️ 已存在`）。用 `best` 时，已经有任何一档音质的文件都算已存在。
 
 ### 下载完成后
 
