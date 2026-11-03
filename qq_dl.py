@@ -65,6 +65,13 @@ QUALITY_MAP = {
     "ape":  {"prefix": "A000", "ext": ".ape",  "label": "无损 APE"},
     "m4a":  {"prefix": "C400", "ext": ".m4a",  "label": "标准 M4A"},
 }
+# --quality best：按这个顺序取第一个有音源的音质
+BEST_ORDER = ["flac", "320", "128"]
+BEST_LABEL = "最佳（无损优先，没有就退到 320 / 128）"
+
+
+def quality_label(quality: str) -> str:
+    return BEST_LABEL if quality == "best" else QUALITY_MAP[quality]["label"]
 
 QR_PATH = Path("/tmp/qq_login_qr.png")  # QQ / 微信登录二维码都存这里
 WX_APPID = "wx48db31d50e334801"  # y.qq.com 网页版在微信开放平台的 appid
@@ -600,6 +607,7 @@ class QQMusicAPI:
         self._login_valid: bool | None = None
         self._album_cache: dict[str, dict] = {}
         self._cover_cache: dict[str, dict | None] = {}
+        self.last_url_problem = ""
 
     def _musics(self, **reqs) -> dict:
         """一次签名请求里带上多个模块调用，返回 {请求名: 结果}"""
@@ -819,9 +827,18 @@ class QQMusicAPI:
 
         return songs
 
-    def get_song_url(self, song_mid: str, quality: str = "320") -> str | None:
-        """获取歌曲播放/下载 URL"""
+    def get_song_url(self, song_mid: str, quality: str = "320", quiet: bool = False) -> str | None:
+        """
+        获取指定音质的下载 URL。这首歌没有这个音质时返回 None，不会拿别的音质顶替，
+        原因写在 self.last_url_problem 里（quiet=False 时也直接打印出来）。
+        """
         quality_info = QUALITY_MAP.get(quality, QUALITY_MAP["320"])
+        self.last_url_problem = ""
+
+        def fail(problem: str) -> None:
+            self.last_url_problem = problem
+            if not quiet:
+                print(f"  ⚠️ {problem}")
 
         # 第一次请求: 不指定 filename，获取默认 purl 和 media_mid
         data_first = {
@@ -853,14 +870,15 @@ class QQMusicAPI:
             purl = req0["midurlinfo"][0].get("purl", "")
             sip = req0.get("sip", [])
         except (KeyError, TypeError, IndexError):
+            fail("无法获取链接：接口返回异常")
             return None
 
         if not purl:
             # purl 为空 = 无权限 (非会员/付费歌曲)，或者登录已失效 (此时服务端按匿名处理)
             if self.login_valid() is False:
-                print(f"  ⚠️ 无法获取链接：登录已失效（不是会员问题），请重新登录：{self.relogin_hint()}")
+                fail(f"无法获取链接：登录已失效（不是会员问题），请重新登录：{self.relogin_hint()}")
             else:
-                print(f"  ⚠️ 无法获取链接 (可能需要会员或歌曲不可用)")
+                fail("无法获取链接 (可能需要会员或歌曲不可用)")
             return None
 
         # 从 purl 提取 media_mid
@@ -900,10 +918,16 @@ class QQMusicAPI:
             result2 = self._request_fcg(data_second, use_sign=False)
             try:
                 purl2 = result2["req_0"]["data"]["midurlinfo"][0].get("purl", "")
-                if purl2:
-                    purl = purl2
             except (KeyError, TypeError, IndexError):
-                pass
+                purl2 = ""
+            if not purl2:
+                # 以前这里会退回默认的 m4a 链接，结果把 m4a 存成 .flac / .mp3
+                fail(f"这首歌没有{quality_info['label']}音源")
+                return None
+            purl = purl2
+        elif not media_mid and quality != "m4a":
+            fail("无法获取链接：拿不到音频文件 ID")
+            return None
 
         # 拼接最终 URL
         domain = sip[1] if len(sip) > 1 else (sip[0] if sip else "https://ws.stream.qqmusic.qq.com/")
@@ -995,7 +1019,8 @@ class QQMusicAPI:
         try:
             d = r["album"]["data"]
             basic = d.get("basicInfo") or {}
-            result["artists"] = [s["name"] for s in (d.get("singer") or {}).get("singerList", []) if s.get("name")]
+            result["name"] = (basic.get("albumName") or "").replace(" ", " ")
+            result["artists"] =[s["name"] for s in (d.get("singer") or {}).get("singerList", []) if s.get("name")]
             result["date"] = _clean_date(basic.get("publishDate"))
             result["label"] = (d.get("company") or {}).get("name", "")
             result["genre"] = basic.get("genre", "")
@@ -1015,15 +1040,42 @@ class QQMusicAPI:
                     break
                 items += more
             result["tracks"] = [
-                {"mid": it["songInfo"]["mid"], "cd": it["songInfo"].get("index_cd") or 0,
-                 "index": it["songInfo"].get("index_album") or 0}
-                for it in items if (it.get("songInfo") or {}).get("mid")
+                {"mid": si["mid"], "cd": si.get("index_cd") or 0, "index": si.get("index_album") or 0,
+                 "name": (si.get("name") or si.get("title") or "").replace(" ", " "),
+                 "singer": ", ".join(s.get("name", "") for s in si.get("singer") or []),
+                 "duration": si.get("interval", 0)}
+                for si in (it.get("songInfo") or {} for it in items) if si.get("mid")
             ]
         except (KeyError, TypeError, AttributeError):
             pass
 
         self._album_cache[album_mid] = result
         return result
+
+    def search_albums(self, keyword: str, num: int = 10) -> list[dict]:
+        """搜索专辑（同一个签名搜索接口，search_type=2）"""
+        data = self._search_payload(keyword, 1, num)
+        data["req_1"]["param"]["search_type"] = 2
+        result = self._request_fcg(data, use_sign=True)
+        try:
+            items = result["req_1"]["data"]["body"]["album"]["list"]
+        except (KeyError, TypeError):
+            return []
+        return [{
+            "mid": a.get("albumMID", ""),
+            "name": a.get("albumName", "").replace(" ", " "),
+            "singer": a.get("singerName") or ", ".join(s.get("name", "") for s in a.get("singer_list") or []),
+            "date": a.get("publicTime", ""),
+            "count": a.get("song_count", 0),
+        } for a in items if a.get("albumMID")]
+
+    def get_album_songs(self, album_mid: str) -> tuple[str, list[dict]]:
+        """专辑名 + 按"第几张碟、第几轨"排好序的曲目（和搜索结果同样的字段）"""
+        info = self._album_info(album_mid)
+        tracks = sorted(info.get("tracks", []), key=lambda t: (t["cd"], t["index"]))
+        songs = [{"mid": t["mid"], "name": t["name"], "singer": t["singer"], "album": info.get("name", ""),
+                  "album_mid": album_mid, "duration": t["duration"]} for t in tracks]
+        return info.get("name", ""), songs
 
     def fetch_cover(self, meta: dict) -> dict | None:
         """
@@ -1517,10 +1569,30 @@ def interactive_search(api: QQMusicAPI, quality: str):
                 download_song(api, songs[idx], quality)
 
 
-def download_song(api: QQMusicAPI, song: dict, quality: str):
+def song_path(meta: dict, ext: str, layout: str) -> Path:
+    """
+    flat：  歌手 - 歌名.flac
+    album： 专辑名/01 歌名.flac（多碟专辑是 1-01 歌名.flac）；没有专辑或音轨号时退回 歌手 - 歌名
+    """
+    title = meta["title"]
+    singer = ", ".join(meta["artists"])
+    if layout == "album" and meta.get("album"):
+        track, disc = meta.get("track"), meta.get("disc") or 1
+        if not track:
+            stem = f"{singer} - {title}"
+        elif (meta.get("disc_total") or 1) > 1:
+            stem = f"{disc}-{track:02d} {title}"
+        else:
+            stem = f"{track:02d} {title}"
+        return DOWNLOAD_DIR / sanitize_filename(meta["album"]) / sanitize_filename(f"{stem}{ext}")
+    return DOWNLOAD_DIR / sanitize_filename(f"{singer} - {title}{ext}")
+
+
+def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat") -> str:
     """
     下载单首歌曲：下到 .part 临时文件 → 检查音频 → 写标签和封面 → 回读校验 → 改成正式文件名。
     任何一步不过关都不会留下正式文件，所以"已存在就跳过"跳过的一定是完整的文件。
+    返回 "ok" / "skip" / "fail"。
     """
     mid = song["mid"]
     meta = api.get_song_meta(mid)
@@ -1532,24 +1604,35 @@ def download_song(api: QQMusicAPI, song: dict, quality: str):
             "track": None, "track_total": None, "disc": None, "disc_total": None,
             "date": "", "genre": "", "label": "", "lyrics": "", "duration": song.get("duration", 0),
         }
-    name = meta["title"] or song["name"]
-    singer = ", ".join(meta["artists"]) or song["singer"]
+    meta["title"] = meta["title"] or song["name"]
+    meta["artists"] = meta["artists"] or [song["singer"]]
+    name, singer = meta["title"], ", ".join(meta["artists"])
 
-    quality_info = QUALITY_MAP.get(quality, QUALITY_MAP["320"])
-    ext = quality_info["ext"]
-    filename = sanitize_filename(f"{singer} - {name}{ext}")
-    output_path = DOWNLOAD_DIR / filename
-    part_path = output_path.with_name(f"{output_path.stem}.part{ext}")
+    candidates = BEST_ORDER if quality == "best" else [quality]
+    for q in candidates:
+        existing = song_path(meta, QUALITY_MAP[q]["ext"], layout)
+        if existing.exists() and existing.stat().st_size > 0:
+            print(f"  ⏭️  已存在: {existing.relative_to(DOWNLOAD_DIR)}")
+            return "skip"
 
-    if output_path.exists() and output_path.stat().st_size > 0:
-        print(f"  ⏭️  已存在: {filename}")
-        return
+    print(f"  🎵 {singer} - {name} [{quality_label(quality)}]")
 
-    print(f"  🎵 {singer} - {name} [{quality_info['label']}]")
-
-    url = api.get_song_url(mid, quality)
+    url = None
+    for q in candidates:
+        url = api.get_song_url(mid, q, quiet=len(candidates) > 1)
+        if url:
+            break
     if not url:
-        return
+        if len(candidates) > 1:
+            print(f"  ⚠️ {api.last_url_problem}")
+        return "fail"
+    quality_info = QUALITY_MAP[q]
+    ext = quality_info["ext"]
+    if len(candidates) > 1:
+        print(f"  🎚️  音质：{quality_info['label']}")
+    output_path = song_path(meta, ext, layout)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path = output_path.with_name(f"{output_path.stem}.part{ext}")
 
     problem = ""
     for attempt in (1, 2):
@@ -1565,7 +1648,7 @@ def download_song(api: QQMusicAPI, song: dict, quality: str):
     if problem:
         print(f"  ❌ {problem}")
         part_path.unlink(missing_ok=True)
-        return
+        return "fail"
 
     cover = api.fetch_cover(meta)
     if not cover:
@@ -1583,12 +1666,13 @@ def download_song(api: QQMusicAPI, song: dict, quality: str):
     if problems:
         print(f"  ❌ 元数据校验没通过: {'; '.join(problems)}")
         part_path.unlink(missing_ok=True)
-        return
+        return "fail"
 
     part_path.replace(output_path)
     print(f"  🏷️  {_meta_summary(meta, cover)}")
     print(f"  🔍 校验通过：大小与服务器一致 · 时长 {format_duration(meta['duration'])} · {how} · 标签和封面回读一致")
     print(f"  ✅ 已保存: {output_path}")
+    return "ok"
 
 
 def interactive_playlists(api: QQMusicAPI, quality: str):
@@ -1631,9 +1715,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="QQ音乐下载器 - 支持扫码登录 + 会员音质")
-    parser.add_argument("command", nargs="?", default="", help="命令: search/搜索, song/歌曲, playlist/歌单")
-    parser.add_argument("query", nargs="?", default="", help="搜索关键词 / songMid / 歌单ID")
-    parser.add_argument("--quality", "-q", default="320", choices=list(QUALITY_MAP.keys()), help="音质 (128/320/flac/ape/m4a)")
+    parser.add_argument("command", nargs="?", default="", help="命令: search/搜索, song/歌曲, album/专辑, playlist/歌单")
+    parser.add_argument("query", nargs="?", default="", help="搜索关键词 / songMid / albumMid 或专辑关键词 / 歌单ID")
+    parser.add_argument("--quality", "-q", default="320", choices=list(QUALITY_MAP.keys()) + ["best"],
+                        help="音质 (128/320/flac/ape/m4a；best = 无损优先，没有就退到 320 / 128)")
+    parser.add_argument("--layout", choices=["flat", "album"], default=None,
+                        help="flat = 歌手 - 歌名.flac；album = 专辑名/01 歌名.flac。album 命令默认 album，其他默认 flat")
     parser.add_argument("--login", action="store_true", help="强制重新登录")
     parser.add_argument("--login-type", choices=["qq", "wx"], default=None,
                         help="扫码登录方式: qq=手机 QQ, wx=微信。默认沿用上次的登录方式，没登录过则用 qq")
@@ -1683,7 +1770,9 @@ def main():
         sys.exit(0)
 
     print(f"\n✅ 当前登录: {cm.account_label}")
-    print(f"   音质选择: {QUALITY_MAP[args.quality]['label']}")
+    print(f"   音质选择: {quality_label(args.quality)}")
+    is_album_cmd = args.command in ("album", "专辑", "al")
+    layout = args.layout or ("album" if is_album_cmd else "flat")
 
     # 执行命令
     if args.command in ("search", "搜索", "s"):
@@ -1705,18 +1794,56 @@ def main():
             if not (0 <= idx < len(songs)):
                 print(f"❌ 序号超出范围 (共 {len(songs)} 条结果)")
                 sys.exit(1)
-            download_song(api, songs[idx], args.quality)
+            download_song(api, songs[idx], args.quality, layout)
         else:
             # 未指定 --first / --index 时，默认下载全部结果 (非交互，不会阻塞)
             for song in songs:
-                download_song(api, song, args.quality)
+                download_song(api, song, args.quality, layout)
 
     elif args.command in ("song", "歌曲"):
         if not args.query:
             print("❌ 请提供 songMid")
             sys.exit(1)
         song = {"mid": args.query, "name": args.query, "singer": "Unknown", "duration": 0}
-        download_song(api, song, args.quality)
+        download_song(api, song, args.quality, layout)
+
+    elif is_album_cmd:
+        if not args.query:
+            print("❌ 请提供 albumMid 或专辑关键词")
+            sys.exit(1)
+        album_mid = ""
+        if re.fullmatch(r"[0-9A-Za-z]{14}", args.query) and api._album_info(args.query).get("tracks"):
+            album_mid = args.query
+        else:
+            albums = api.search_albums(args.query)
+            if not albums:
+                print("没有找到专辑")
+                sys.exit(1)
+            print("\n专辑搜索结果:")
+            for i, a in enumerate(albums, 1):
+                print(f"  {i}. {a['singer']} - {a['name']} · {a['date']} · {a['count']} 首 · {a['mid']}")
+            if not (args.first or args.index is not None):
+                # 不带序号只列出结果，不下载（一次下 10 张专辑不是想要的）
+                print("\n加 --first 或 --index N 下载其中一张，或者 album <albumMid>")
+                sys.exit(0)
+            idx = 0 if args.first else (args.index - 1)
+            if not (0 <= idx < len(albums)):
+                print(f"❌ 序号超出范围 (共 {len(albums)} 张)")
+                sys.exit(1)
+            album_mid = albums[idx]["mid"]
+
+        album_name, songs = api.get_album_songs(album_mid)
+        if not songs:
+            print("❌ 拿不到这张专辑的曲目")
+            sys.exit(1)
+        print(f"\n💿 专辑《{album_name}》共 {len(songs)} 首")
+        results = []
+        for i, song in enumerate(songs, 1):
+            print(f"\n[{i}/{len(songs)}]", end="")
+            results.append(download_song(api, song, args.quality, layout))
+        print(f"\n💿 《{album_name}》：✅ 新下载 {results.count('ok')} 首 · ⏭️ 已存在 {results.count('skip')} 首 · ❌ 失败 {results.count('fail')} 首")
+        if "fail" in results:
+            sys.exit(2)
 
     elif args.command in ("playlist", "歌单", "pl"):
         if not args.query:
@@ -1731,7 +1858,7 @@ def main():
             print(f"歌单共 {len(songs)} 首歌")
             for i, song in enumerate(songs, 1):
                 print(f"\n[{i}/{len(songs)}]", end="")
-                download_song(api, song, args.quality)
+                download_song(api, song, args.quality, layout)
 
     else:
         # 交互模式
@@ -1741,7 +1868,7 @@ def main():
             print("=" * 50)
             print("  1. 搜索下载")
             print("  2. 下载歌单")
-            print("  3. 切换音质 (当前: {})".format(QUALITY_MAP[args.quality]["label"]))
+            print("  3. 切换音质 (当前: {})".format(quality_label(args.quality)))
             print("  4. 重新登录")
             print("  5. 退出")
 

@@ -3,7 +3,7 @@
 一个 [Claude Agent Skill](https://docs.claude.com/en/docs/claude-code/skills)，让 AI agent 能搜索并下载 QQ 音乐的歌曲，支持会员音质（FLAC 无损 / 320kbps / 128kbps / M4A）。也可以脱离 agent 当普通命令行工具直接用。
 
 - **搜索**：中英文歌名、歌手名，走 `musics.fcg` 签名接口（`zzc` 签名），**无需登录即可搜索**。
-- **下载**：按搜索结果、`songMid` 或歌单 ID 下载；高音质需要 QQ 音乐会员权限。
+- **下载**：按搜索结果、`songMid`、整张专辑或歌单 ID 下载；高音质需要 QQ 音乐会员权限。`--quality best` 每首取能拿到的最高音质。
 - **元数据**：自动写入歌名、歌手、专辑、专辑艺人、音轨号 / 碟号、发行日期、流派、唱片公司、歌词，以及专辑原图级别的高清封面。
 - **不留坏文件**：下载后检查字节数、时长，并完整解码校验（FLAC 比对自带 MD5，逐位无损），写完标签再回读一遍。任何一步不过关都不会生成正式文件。
 - **登录**：手机 QQ 或微信**扫码登录**，Cookie 本地缓存；微信登录的凭证会自动续期。不走任何反代 / 破解服务。
@@ -36,6 +36,10 @@ python3 qq_dl.py search "周杰伦" --index 3 --quality 320
 # 已知 songMid，直接下载
 python3 qq_dl.py song <songMid> --quality flac
 
+# 搜专辑（只列出结果），再按 albumMid 下载整张，存成 专辑名/01 歌名.flac
+python3 qq_dl.py album "伊能静 关不住"
+python3 qq_dl.py album <albumMid> --quality best
+
 # 下载整个歌单
 python3 qq_dl.py playlist <歌单ID> --quality 320
 
@@ -55,8 +59,13 @@ python3 qq_dl.py --login --login-type wx  # 微信扫码
 | `flac` | FLAC 无损（需会员）|
 | `ape` | APE 无损（需会员）|
 | `m4a` | 默认 M4A |
+| `best` | 无损优先，这首没有无损就退到 320，再没有就 128 |
 
-不指定 `--quality` 时默认 `320`。会员无权限的歌会打印提示并跳过，可降级到 `128` 重试。默认下载到 `~/Music/QQMusic`，用 `--output-dir` 改。
+不指定 `--quality` 时默认 `320`。会员无权限的歌会打印提示并跳过，可降级到 `128` 重试。指定的音质这首歌没有时也会跳过，不会拿别的音质顶替。默认下载到 `~/Music/QQMusic`，用 `--output-dir` 改。
+
+### 文件夹结构
+
+`--layout flat`（`search` / `song` / `playlist` 的默认）存成 `歌手 - 歌名.flac`；`--layout album`（`album` 的默认）存成 `专辑名/01 歌名.flac`，多碟专辑是 `1-01 歌名.flac`。
 
 ## 下载结果
 
