@@ -1195,17 +1195,19 @@ def download_file(url: str, output_path: Path, show_progress: bool = True):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     downloaded = 0
-    with open(output_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=32768):
-            f.write(chunk)
-            downloaded += len(chunk)
-            if show_progress and total > 0:
-                pct = downloaded / total * 100
-                bar = "█" * int(pct / 2) + "░" * (50 - int(pct / 2))
-                print(f"\r  下载中 [{bar}] {pct:.1f}%", end="", flush=True)
-
-    if show_progress:
-        print()  # 换行
+    try:
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=32768):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if show_progress and total > 0:
+                    pct = downloaded / total * 100
+                    bar = "█" * int(pct / 2) + "░" * (50 - int(pct / 2))
+                    print(f"\r  下载中 [{bar}] {pct:.1f}%", end="", flush=True)
+    finally:
+        # 中途断线也要换行，否则后面的报错会和进度条挤在同一行，被过滤进度条的人一起滤掉
+        if show_progress:
+            print()
     if total and downloaded != total:
         raise IOError(f"只收到 {downloaded} / {total} 字节")
 
