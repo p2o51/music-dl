@@ -1315,6 +1315,8 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
                 audio[key] = str(value)
         if len(artists) > 1:
             audio["ARTISTS"] = artists  # 多值字段，Navidrome / Picard 等按这个拆分歌手
+        elif "ARTISTS" in audio:
+            del audio["ARTISTS"]
         if cover:
             pic = Picture()
             pic.type = 3  # front cover
@@ -1326,7 +1328,7 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
         audio.save(deleteid3=True)  # FLAC 前面夹带的 ID3 头是非标准的，顺手去掉
 
     elif ext == ".mp3":
-        from mutagen.id3 import (ID3, APIC, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TPOS, TPUB, TRCK, USLT,
+        from mutagen.id3 import (ID3, APIC, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TPOS, TPUB, TRCK, TXXX, USLT,
                                  Encoding, ID3NoHeaderError)
         try:
             tags = ID3(path)
@@ -1342,11 +1344,18 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
             tags.setall("TRCK", [TRCK(encoding=enc, text=f"{track}/{track_total}" if track_total else str(track))])
         if disc:
             tags.setall("TPOS", [TPOS(encoding=enc, text=f"{disc}/{disc_total}" if disc_total else str(disc))])
+        if len(artists) > 1:
+            # TPE1 是给人看的「A, B」，Navidrome 不按逗号拆；多值的 TXXX:ARTISTS 它优先用来拆歌手
+            tags.setall("TXXX:ARTISTS", [TXXX(encoding=enc, desc="ARTISTS", text=artists)])
+        else:
+            tags.delall("TXXX:ARTISTS")
         if f["lyrics"]:
             tags.setall("USLT", [USLT(encoding=enc, lang="XXX", desc="", text=f["lyrics"])])
         if cover:
             tags.setall("APIC", [APIC(encoding=enc, mime=cover["mime"], type=3, desc="", data=cover["data"])])
-        tags.save(path, v1=0, v2_version=3)  # v1=0: 删掉 ID3v1（老 MP3 里常是 GBK 编码，最容易乱码）
+        # v1=0: 删掉 ID3v1（老 MP3 里常是 GBK 编码，最容易乱码）
+        # v23_sep=None: 多值用 \0 分隔而不是「/」，否则 ARTISTS 读回来是一个「A/B」
+        tags.save(path, v1=0, v2_version=3, v23_sep=None)
 
     elif ext == ".m4a":
         from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
@@ -1360,6 +1369,10 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
                 audio[key] = [value]
         if f["label"]:
             audio["----:com.apple.iTunes:LABEL"] = [MP4FreeForm(f["label"].encode("utf-8"))]
+        if len(artists) > 1:
+            audio["----:com.apple.iTunes:ARTISTS"] = [MP4FreeForm(a.encode("utf-8")) for a in artists]
+        else:
+            audio.pop("----:com.apple.iTunes:ARTISTS", None)
         if track:
             audio["trkn"] = [(int(track), int(track_total or 0))]
         if disc:
