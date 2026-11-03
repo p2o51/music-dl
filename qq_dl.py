@@ -9,9 +9,11 @@ QQ音乐下载器 - 支持二维码扫码登录 + 会员音质
   python qq_music_dl.py search 周杰伦  # 搜索并下载
   python qq_music_dl.py song 001ABC   # 直接下载指定 songMid
   python qq_music_dl.py playlist 123  # 下载整个歌单
+  python qq_music_dl.py --login --login-type wx  # 微信扫码登录
 
 依赖:
-  pip install requests qrcode Pillow
+  pip install requests mutagen Pillow qrcode
+  (可选) ffmpeg: 下载后完整解码一遍，检查音频有没有损坏
 
 音质选择 (有会员可用高品质):
   --quality 128    标准MP3 128kbps
@@ -24,9 +26,13 @@ Cookie 保存位置: ~/.qqmusic_cookie.json
 
 import base64
 import hashlib
+import html
+import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -59,6 +65,14 @@ QUALITY_MAP = {
     "ape":  {"prefix": "A000", "ext": ".ape",  "label": "无损 APE"},
     "m4a":  {"prefix": "C400", "ext": ".m4a",  "label": "标准 M4A"},
 }
+
+QR_PATH = Path("/tmp/qq_login_qr.png")  # QQ / 微信登录二维码都存这里
+WX_APPID = "wx48db31d50e334801"  # y.qq.com 网页版在微信开放平台的 appid
+KEY_REFRESH_MARGIN = 12 * 3600  # 微信登录的 musickey 只有 3 天，过期前 12 小时内就自动续期
+
+COVER_MAX_SIDE = 3000  # 原图超过这个边长就退到 1200 版，避免把十几 MB 的图塞进每首歌
+COVER_MAX_BYTES = 8 * 1024 * 1024
+COVER_MIN_SIDE = 300
 
 # ─── 签名算法 (纯 Python 实现) ──────────────────────────────────────────
 
@@ -114,8 +128,9 @@ class CookieManager:
             return False
 
     def save(self):
-        """保存 Cookie 到文件"""
+        """保存 Cookie 到文件（里面有登录凭证，只给自己读写）"""
         COOKIE_FILE.write_text(json.dumps(self.cookies, ensure_ascii=False, indent=2))
+        os.chmod(COOKIE_FILE, 0o600)
 
     def set(self, cookie_dict: dict):
         """设置 Cookie"""
@@ -123,9 +138,38 @@ class CookieManager:
         self._apply_cookies()
         self.save()
 
+    def replace(self, cookie_dict: dict):
+        """整体替换 Cookie。重新登录时用，免得上一个账号的 uin / key 残留下来串号"""
+        self.cookies = dict(cookie_dict)
+        self.session.cookies.clear()
+        self._apply_cookies()
+        self.save()
+
+    def update_from_wx_login(self, data: dict, replace: bool = False):
+        """把 music.login.LoginServer.Login 的返回写进 Cookie（微信扫码登录 / 续期共用）"""
+        new = {
+            "wxuin": str(data["musicid"]),
+            "qm_keyst": data["musickey"],
+            "qqmusic_key": data["musickey"],
+            "tmeLoginType": "1",
+            "login_type": "2",
+            "_key_created": int(time.time()),
+            "_key_expires_in": int(data.get("keyExpiresIn") or 0),
+        }
+        for src, dst in (("openid", "wxopenid"), ("refresh_token", "wxrefresh_token"),
+                         ("unionid", "wxunionid"), ("encryptUin", "euin"), ("refresh_key", "refresh_key")):
+            if data.get(src):
+                new[dst] = str(data[src])
+        if replace:
+            self.replace(new)
+        else:
+            self.set(new)
+
     def _apply_cookies(self):
         """将 Cookie 应用到 session"""
         for k, v in self.cookies.items():
+            if k.startswith("_"):  # _ 开头的是本地记录（如 key 签发时间），不发给服务端
+                continue
             self.session.cookies.set(k, str(v), domain=".qq.com")
 
     @property
@@ -153,6 +197,31 @@ class CookieManager:
     @property
     def is_logged_in(self) -> bool:
         return bool(self.uin and self.uin != "0" and self.music_key)
+
+    @property
+    def login_type(self) -> str:
+        """"wx" = 微信登录（key 以 W_X_ 开头），"qq" = QQ 登录"""
+        if str(self.cookies.get("tmeLoginType", "")) == "1" or self.music_key.startswith("W_X_"):
+            return "wx"
+        return "qq"
+
+    @property
+    def account_label(self) -> str:
+        return f"{'微信' if self.login_type == 'wx' else 'QQ'} {self.uin}"
+
+
+def save_qr_image(content: bytes) -> Path:
+    """保存登录二维码。放大并加白边，方便发到手机上长按识别，或者用另一台设备扫。"""
+    try:
+        from PIL import Image, ImageOps
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+        scale = max(1, 560 // max(img.size))
+        if scale > 1:
+            img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+        ImageOps.expand(img, border=32, fill="white").save(QR_PATH, "PNG")
+    except Exception:
+        QR_PATH.write_bytes(content)
+    return QR_PATH
 
 
 # ─── 二维码登录 ─────────────────────────────────────────────────────────
@@ -211,8 +280,7 @@ class QQrLogin:
         qrsig = self.sess.cookies.get("qrsig", "")
 
         # 保存二维码图片
-        qr_path = Path("/tmp/qq_login_qr.png")
-        qr_path.write_bytes(qr_resp.content)
+        save_qr_image(qr_resp.content)
 
         # 生成终端二维码
         qr_content = f"pt_login_sig={pt_login_sig}" if pt_login_sig else ""
@@ -395,7 +463,7 @@ class QQrLogin:
 
             # 获取 Cookie
             cookies = self.step3_get_cookies(result)
-            self.cm.set(cookies)
+            self.cm.replace(cookies)
 
             if self.cm.is_logged_in:
                 print(f"\n🎉 登录成功！QQ 号: {self.cm.uin}")
@@ -432,11 +500,192 @@ class QQrLogin:
             })
 
 
+class WxQrLogin:
+    """
+    微信扫码登录（和 y.qq.com 网页版走同一条路）
+    流程: 微信开放平台 qrconnect 拿二维码 → 长轮询扫码状态拿 code → music.login.LoginServer.Login 换 musickey
+    """
+
+    POLL_TIMEOUT = 180  # 秒
+
+    def __init__(self, cm: CookieManager, api: "QQMusicAPI"):
+        self.cm = cm
+        self.api = api
+        self.sess = requests.Session()
+        self.sess.headers.update({"User-Agent": UA})
+
+    def _get_qrcode(self) -> str:
+        """拉取二维码并保存图片，返回 uuid"""
+        resp = self.sess.get("https://open.weixin.qq.com/connect/qrconnect", params={
+            "appid": WX_APPID,
+            "redirect_uri": "https://y.qq.com/portal/wx_redirect.html?login_type=2&surl=https://y.qq.com/",
+            "response_type": "code",
+            "scope": "snsapi_login",
+            "state": "STATE",
+            "href": "https://y.qq.com/mediastyle/music_v17/src/css/popup_wechat.css#wechat_redirect",
+        })
+        m = re.search(r"/connect/qrcode/([\w-]+)", resp.text)
+        if not m:
+            raise RuntimeError("微信开放平台没有返回二维码")
+        uuid = m.group(1)
+        save_qr_image(self.sess.get(f"https://open.weixin.qq.com/connect/qrcode/{uuid}").content)
+        return uuid
+
+    def _poll(self, uuid: str) -> str | None:
+        """长轮询扫码状态，确认后返回微信 code。408=等待扫码 404=已扫码 405=已确认 403=取消 402=过期"""
+        deadline = time.time() + self.POLL_TIMEOUT
+        last = None
+        while time.time() < deadline:
+            params = {"uuid": uuid, "_": int(time.time() * 1000)}
+            if last:
+                params["last"] = last
+            try:
+                text = self.sess.get(
+                    "https://lp.open.weixin.qq.com/connect/l/qrconnect",
+                    params=params, headers={"Referer": "https://open.weixin.qq.com/"}, timeout=40,
+                ).text
+            except requests.RequestException:
+                time.sleep(2)
+                continue
+
+            m = re.search(r"wx_errcode=(\d+);window\.wx_code='([^']*)'", text)
+            if not m:
+                time.sleep(2)
+                continue
+            errcode, code = m.groups()
+            if errcode == "404" and last != "404":
+                print("✅ 已扫码，请在手机上确认登录...")
+            last = errcode
+
+            if errcode == "405":
+                return code
+            if errcode == "403":
+                print("❌ 已在手机上取消登录")
+                return None
+            if errcode == "402":
+                print("⏰ 二维码已过期")
+                return None
+
+        print("⏰ 扫码超时")
+        return None
+
+    def login(self) -> bool:
+        print("\n" + "=" * 50)
+        print("  🎵 QQ 音乐登录 - 微信扫码授权")
+        print("=" * 50)
+
+        uuid = self._get_qrcode()
+        print(f"\n📱 二维码已保存到: {QR_PATH}")
+        print("   请用微信扫码（在手机上看到这张图时可以长按识别）")
+        print(f"\n⏳ 等待扫码...（最长 {self.POLL_TIMEOUT} 秒）")
+
+        code = self._poll(uuid)
+        if not code:
+            return False
+
+        data = self.api.wx_login(code)
+        if not data:
+            print("❌ 微信已确认，但换取 QQ 音乐凭证失败")
+            return False
+        self.cm.update_from_wx_login(data, replace=True)
+        print(f"\n🎉 登录成功！{self.cm.account_label}")
+        return True
+
+
 # ─── QQ 音乐 API ───────────────────────────────────────────────────────
 
 class QQMusicAPI:
     def __init__(self, cm: CookieManager):
         self.cm = cm
+        self._login_valid: bool | None = None
+        self._album_cache: dict[str, dict] = {}
+        self._cover_cache: dict[str, dict | None] = {}
+
+    def _musics(self, **reqs) -> dict:
+        """一次签名请求里带上多个模块调用，返回 {请求名: 结果}"""
+        comm = {
+            "ct": 24,
+            "cv": 0,
+            "format": "json",
+            "uin": int(self.cm.uin) if self.cm.uin.isdigit() else 0,
+            "authst": self.cm.music_key,
+        }
+        return self._request_fcg({"comm": comm, **reqs}, use_sign=True)
+
+    # ── 登录状态 ──
+
+    def _wx_login_call(self, param: dict, with_auth: bool) -> dict | None:
+        comm = {"tmeLoginType": "1", "ct": 24, "cv": 0, "format": "json", "uin": 0}
+        if with_auth:
+            comm["uin"] = int(self.cm.uin) if self.cm.uin.isdigit() else 0
+            comm["authst"] = self.cm.music_key
+        req = {"module": "music.login.LoginServer", "method": "Login", "param": param}
+        r0 = self._request_fcg({"comm": comm, "req_0": req}).get("req_0", {})
+        data = r0.get("data") or {}
+        if r0.get("code") == 0 and data.get("musickey") and data.get("musicid"):
+            return data
+        return None
+
+    def wx_login(self, code: str) -> dict | None:
+        """用微信扫码拿到的 code 换 QQ 音乐的 musickey"""
+        return self._wx_login_call({"code": code, "strAppid": WX_APPID}, with_auth=False)
+
+    def refresh_login(self) -> bool:
+        """用 refresh_token 续期微信登录的 musickey（新 key 3 天有效，同时换一个新的 refresh_token）"""
+        c = self.cm.cookies
+        if self.cm.login_type != "wx" or not c.get("wxrefresh_token") or not self.cm.uin.isdigit():
+            return False
+        data = self._wx_login_call({
+            "refresh_key": c.get("refresh_key", ""),
+            "refresh_token": c["wxrefresh_token"],
+            "musickey": self.cm.music_key,
+            "musicid": int(self.cm.uin),
+        }, with_auth=True)
+        if not data:
+            return False
+        self.cm.update_from_wx_login(data)
+        self._login_valid = True
+        return True
+
+    def login_valid(self) -> bool | None:
+        """
+        用会员查询接口探一下 musickey 还有没有效。
+        失效时这个接口返回 code 1000，而取链接接口只会返回空 purl，看起来和"没有会员"一模一样。
+        返回 None 表示判断不了。
+        """
+        if self._login_valid is None and self.cm.is_logged_in:
+            data = {
+                "comm": {
+                    "uin": int(self.cm.uin) if self.cm.uin.isdigit() else 0,
+                    "format": "json", "ct": 24, "cv": 0,
+                    "authst": self.cm.music_key,
+                    "tmeLoginType": "1" if self.cm.login_type == "wx" else "2",
+                },
+                "req_0": {"module": "userInfo.VipQueryServer", "method": "SRFVipQuery_V2",
+                          "param": {"uin_list": [self.cm.uin]}},
+            }
+            code = self._request_fcg(data, use_sign=False).get("req_0", {}).get("code")
+            if code == 0:
+                self._login_valid = True
+            elif code == 1000:
+                self._login_valid = False
+        return self._login_valid
+
+    def ensure_fresh_login(self):
+        """微信登录的 key 快过期或已过期时，自动用 refresh_token 续期"""
+        c = self.cm.cookies
+        if self.cm.login_type != "wx" or not c.get("wxrefresh_token"):
+            return
+        created, ttl = c.get("_key_created"), c.get("_key_expires_in")
+        if created and ttl and time.time() < created + ttl - KEY_REFRESH_MARGIN:
+            return
+        if self.refresh_login():
+            print("🔄 已自动续期微信登录（新凭证 3 天有效）")
+        elif self.login_valid() is False:
+            print("⚠️ 微信登录已过期，自动续期也失败了，需要重新扫码：qq_dl.py --login --login-type wx")
+
+    def relogin_hint(self) -> str:
+        return "qq_dl.py --login" + (" --login-type wx" if self.cm.login_type == "wx" else "")
 
     def _request_fcg(self, data: dict, use_sign: bool = True, host: str = "u.y.qq.com") -> dict:
         """
@@ -607,8 +856,11 @@ class QQMusicAPI:
             return None
 
         if not purl:
-            # purl 为空 = 无权限 (非会员/付费歌曲)
-            print(f"  ⚠️ 无法获取链接 (可能需要会员或歌曲不可用)")
+            # purl 为空 = 无权限 (非会员/付费歌曲)，或者登录已失效 (此时服务端按匿名处理)
+            if self.login_valid() is False:
+                print(f"  ⚠️ 无法获取链接：登录已失效（不是会员问题），请重新登录：{self.relogin_hint()}")
+            else:
+                print(f"  ⚠️ 无法获取链接 (可能需要会员或歌曲不可用)")
             return None
 
         # 从 purl 提取 media_mid
@@ -663,6 +915,149 @@ class QQMusicAPI:
             full_url = f"{domain}/{purl}"
 
         return full_url
+
+    # ── 元数据 ──
+
+    def get_song_meta(self, song_mid: str) -> dict | None:
+        """歌曲详情 + 歌词 + 专辑信息，整理成写标签用的字段"""
+        r = self._musics(
+            detail={"module": "music.pf_song_detail_svr", "method": "get_song_detail_yqq",
+                    "param": {"song_mid": song_mid, "song_type": 0}},
+            lyric={"module": "music.musichallSong.PlayLyricInfo", "method": "GetPlayLyricInfo",
+                   "param": {"songMID": song_mid, "trans": 0, "roma": 0}},
+        )
+        try:
+            data = r["detail"]["data"]
+            ti = data["track_info"]
+        except (KeyError, TypeError):
+            return None
+        if not ti or not ti.get("mid"):
+            return None
+
+        info = data.get("info") or {}
+
+        def info_values(key: str) -> list[str]:
+            return [c["value"] for c in (info.get(key) or {}).get("content", []) if c.get("value")]
+
+        singers = ti.get("singer") or []
+        album = ti.get("album") or {}
+        meta = {
+            "mid": ti["mid"],
+            "title": (ti.get("name") or ti.get("title") or "").replace(" ", " "),
+            "artists": [s["name"] for s in singers if s.get("name")],
+            "singer_mids": [s["mid"] for s in singers if s.get("mid")],
+            "album": album.get("name", ""),
+            "album_mid": album.get("mid", ""),
+            "album_artists": [],
+            "track": None, "track_total": None,
+            "disc": None, "disc_total": None,
+            "date": _clean_date(album.get("time_public") or ti.get("time_public")),
+            "genre": ", ".join(info_values("genre")),
+            "label": next(iter(info_values("company")), ""),
+            "lyrics": _decode_lyric(r.get("lyric")),
+            "duration": ti.get("interval", 0),
+        }
+
+        if meta["album_mid"]:
+            alb = self._album_info(meta["album_mid"])
+            meta["album_artists"] = alb.get("artists", [])
+            meta["date"] = alb.get("date") or meta["date"]
+            meta["label"] = meta["label"] or alb.get("label", "")
+            meta["genre"] = meta["genre"] or alb.get("genre", "")
+            # QQ 的 index_album 是整张专辑连续编号（第二张碟从 14 接着数），index_cd 从 0 开始，
+            # 这里换算成"第几张碟的第几轨"
+            tracks = alb.get("tracks", [])
+            mine = next((t for t in tracks if t["mid"] == meta["mid"]), None)
+            if mine:
+                same_disc = sorted(t["index"] for t in tracks if t["cd"] == mine["cd"])
+                meta["track"] = same_disc.index(mine["index"]) + 1
+                meta["track_total"] = len(same_disc)
+                meta["disc"] = mine["cd"] + 1
+                meta["disc_total"] = max(t["cd"] for t in tracks) + 1
+            elif (ti.get("index_album") or 0) > 0:
+                meta["track"] = ti["index_album"]
+                meta["disc"] = (ti.get("index_cd") or 0) + 1
+        if not meta["album_artists"]:
+            meta["album_artists"] = meta["artists"]
+        return meta
+
+    def _album_info(self, album_mid: str) -> dict:
+        if album_mid in self._album_cache:
+            return self._album_cache[album_mid]
+
+        r = self._musics(
+            album={"module": "music.musichallAlbum.AlbumInfoServer", "method": "GetAlbumDetail",
+                   "param": {"albumMid": album_mid}},
+            songs={"module": "music.musichallAlbum.AlbumSongList", "method": "GetAlbumSongList",
+                   "param": {"albumMid": album_mid, "begin": 0, "num": 100, "order": 2}},
+        )
+        result: dict = {}
+        try:
+            d = r["album"]["data"]
+            basic = d.get("basicInfo") or {}
+            result["artists"] = [s["name"] for s in (d.get("singer") or {}).get("singerList", []) if s.get("name")]
+            result["date"] = _clean_date(basic.get("publishDate"))
+            result["label"] = (d.get("company") or {}).get("name", "")
+            result["genre"] = basic.get("genre", "")
+        except (KeyError, TypeError, AttributeError):
+            pass
+
+        try:
+            sd = r["songs"]["data"]
+            items = list(sd.get("songList") or [])
+            total = sd.get("totalNum") or len(items)
+            while len(items) < total:
+                more = self._musics(songs={
+                    "module": "music.musichallAlbum.AlbumSongList", "method": "GetAlbumSongList",
+                    "param": {"albumMid": album_mid, "begin": len(items), "num": 100, "order": 2},
+                })["songs"]["data"].get("songList") or []
+                if not more:
+                    break
+                items += more
+            result["tracks"] = [
+                {"mid": it["songInfo"]["mid"], "cd": it["songInfo"].get("index_cd") or 0,
+                 "index": it["songInfo"].get("index_album") or 0}
+                for it in items if (it.get("songInfo") or {}).get("mid")
+            ]
+        except (KeyError, TypeError, AttributeError):
+            pass
+
+        self._album_cache[album_mid] = result
+        return result
+
+    def fetch_cover(self, meta: dict) -> dict | None:
+        """
+        取最清晰的可用封面：专辑原图 → 1200 → 800；没有专辑封面时按 QQ 音乐的做法用歌手图。
+        每张图都完整解码检查过，不合格（解不开、太小、不是方图、太大）就换下一档。
+        """
+        album_mid = meta.get("album_mid") or ""
+        singer_mid = next(iter(meta.get("singer_mids") or []), "")
+        cache_key = album_mid or f"singer:{singer_mid}"
+        if cache_key in self._cover_cache:
+            return self._cover_cache[cache_key]
+
+        candidates = []
+        if album_mid:
+            candidates += [(f"T002M000{album_mid}", "专辑原图"), (f"T002R1200x1200M000{album_mid}", "专辑 1200"),
+                           (f"T002R800x800M000{album_mid}", "专辑 800")]
+        if singer_mid:
+            candidates += [(f"T001M000{singer_mid}", "歌手图原图"), (f"T001R1200x1200M000{singer_mid}", "歌手图 1200")]
+
+        cover = None
+        for name, source in candidates:
+            try:
+                resp = self.cm.session.get(f"https://y.gtimg.cn/music/photo_new/{name}.jpg", timeout=30)
+            except requests.RequestException:
+                continue
+            if resp.status_code != 200 or not resp.content:
+                continue
+            cover = _prepare_cover(resp.content)
+            if cover:
+                cover["source"] = source
+                break
+
+        self._cover_cache[cache_key] = cover
+        return cover
 
     def get_playlist_songs(self, playlist_id: int) -> list[dict]:
         """获取歌单歌曲列表"""
@@ -740,8 +1135,9 @@ def sanitize_filename(name: str) -> str:
 
 
 def download_file(url: str, output_path: Path, show_progress: bool = True):
-    """下载文件，带进度条"""
-    resp = requests.get(url, stream=True, headers={"User-Agent": UA, "Referer": REFERER})
+    """下载文件，带进度条。HTTP 出错或字节数和 Content-Length 对不上都会抛异常"""
+    resp = requests.get(url, stream=True, headers={"User-Agent": UA, "Referer": REFERER}, timeout=60)
+    resp.raise_for_status()
     total = int(resp.headers.get("Content-Length", 0))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -758,6 +1154,316 @@ def download_file(url: str, output_path: Path, show_progress: bool = True):
 
     if show_progress:
         print()  # 换行
+    if total and downloaded != total:
+        raise IOError(f"只收到 {downloaded} / {total} 字节")
+
+
+# ─── 元数据 / 封面 / 校验 ───────────────────────────────────────────────
+
+def _clean_date(value) -> str:
+    """QQ 的日期偶尔是 0000-00-00 之类的占位，只保留有效的 年 / 年-月 / 年-月-日"""
+    parts = str(value or "").strip()[:10].split("-")
+    if not parts or not re.fullmatch(r"\d{4}", parts[0]) or parts[0] == "0000":
+        return ""
+    keep = [parts[0]]
+    for p in parts[1:3]:
+        if not re.fullmatch(r"\d{2}", p) or p == "00":
+            break
+        keep.append(p)
+    return "-".join(keep)
+
+
+def _decode_lyric(resp) -> str:
+    """GetPlayLyricInfo 返回的是 base64 的 LRC；crypt=1 时是加密的 QRC，跳过"""
+    try:
+        d = resp["data"]
+        if d.get("crypt") or not d.get("lyric"):
+            return ""
+        return html.unescape(base64.b64decode(d["lyric"]).decode("utf-8")).strip()
+    except Exception:
+        return ""
+
+
+def inspect_image(data: bytes) -> dict | None:
+    """完整解码一遍图片（截断、损坏的图在这里会失败），返回格式和尺寸"""
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()
+            return {"format": im.format, "width": im.width, "height": im.height, "mode": im.mode}
+    except Exception:
+        return None
+
+
+def _prepare_cover(data: bytes) -> dict | None:
+    """检查一张候选封面，合格就返回写标签要用的信息，不合格返回 None"""
+    info = inspect_image(data)
+    if not info:
+        return None
+    w, h = info["width"], info["height"]
+    if min(w, h) < COVER_MIN_SIDE or not 0.8 <= w / h <= 1.25:
+        return None
+    if max(w, h) > COVER_MAX_SIDE or len(data) > COVER_MAX_BYTES:
+        return None
+    if info["format"] not in ("JPEG", "PNG"):
+        # 极少数接口给的是 WebP 等格式，很多播放器不认，转成 JPEG
+        from PIL import Image
+        buf = io.BytesIO()
+        with Image.open(io.BytesIO(data)) as im:
+            im.convert("RGB").save(buf, "JPEG", quality=95)
+        data, info = buf.getvalue(), inspect_image(buf.getvalue())
+        if not info:
+            return None
+    return {
+        "data": data,
+        "mime": "image/png" if info["format"] == "PNG" else "image/jpeg",
+        "format": info["format"],
+        "width": info["width"],
+        "height": info["height"],
+        "depth": 32 if info["mode"] in ("RGBA", "LA") else 24,
+    }
+
+
+def _tag_fields(meta: dict) -> dict:
+    """各格式共用的标签内容（空值不写）"""
+    return {
+        "title": meta.get("title") or "",
+        "artist": ", ".join(meta.get("artists") or []),
+        "album": meta.get("album") or "",
+        "album_artist": ", ".join(meta.get("album_artists") or []),
+        "date": meta.get("date") or "",
+        "genre": meta.get("genre") or "",
+        "label": meta.get("label") or "",
+        "lyrics": meta.get("lyrics") or "",
+    }
+
+
+def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
+    """把标签和封面写进音频文件。保留文件里原有的其他标签（比如 M4A 的无缝播放信息）"""
+    f = _tag_fields(meta)
+    track, track_total = meta.get("track"), meta.get("track_total")
+    disc, disc_total = meta.get("disc"), meta.get("disc_total")
+    artists = meta.get("artists") or []
+
+    if ext == ".flac":
+        from mutagen.flac import FLAC, Picture
+        audio = FLAC(path)
+        vorbis = {
+            "TITLE": f["title"], "ARTIST": f["artist"], "ALBUM": f["album"], "ALBUMARTIST": f["album_artist"],
+            "DATE": f["date"], "GENRE": f["genre"], "LABEL": f["label"], "LYRICS": f["lyrics"],
+            "TRACKNUMBER": track, "TRACKTOTAL": track_total, "TOTALTRACKS": track_total,
+            "DISCNUMBER": disc, "DISCTOTAL": disc_total, "TOTALDISCS": disc_total,
+        }
+        for key, value in vorbis.items():
+            if value:
+                audio[key] = str(value)
+        if len(artists) > 1:
+            audio["ARTISTS"] = artists  # 多值字段，Navidrome / Picard 等按这个拆分歌手
+        if cover:
+            pic = Picture()
+            pic.type = 3  # front cover
+            pic.mime = cover["mime"]
+            pic.width, pic.height, pic.depth = cover["width"], cover["height"], cover["depth"]
+            pic.data = cover["data"]
+            audio.clear_pictures()
+            audio.add_picture(pic)
+        audio.save(deleteid3=True)  # FLAC 前面夹带的 ID3 头是非标准的，顺手去掉
+
+    elif ext == ".mp3":
+        from mutagen.id3 import (ID3, APIC, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TPOS, TPUB, TRCK, USLT,
+                                 Encoding, ID3NoHeaderError)
+        try:
+            tags = ID3(path)
+        except ID3NoHeaderError:
+            tags = ID3()
+        enc = Encoding.UTF16  # 存成 ID3v2.3，v2.3 不支持 UTF-8，用 UTF-16 才不会乱码
+        for frame_cls, value in ((TIT2, f["title"]), (TPE1, f["artist"]), (TALB, f["album"]),
+                                 (TPE2, f["album_artist"]), (TDRC, f["date"]), (TCON, f["genre"]),
+                                 (TPUB, f["label"])):
+            if value:
+                tags.setall(frame_cls.__name__, [frame_cls(encoding=enc, text=value)])
+        if track:
+            tags.setall("TRCK", [TRCK(encoding=enc, text=f"{track}/{track_total}" if track_total else str(track))])
+        if disc:
+            tags.setall("TPOS", [TPOS(encoding=enc, text=f"{disc}/{disc_total}" if disc_total else str(disc))])
+        if f["lyrics"]:
+            tags.setall("USLT", [USLT(encoding=enc, lang="XXX", desc="", text=f["lyrics"])])
+        if cover:
+            tags.setall("APIC", [APIC(encoding=enc, mime=cover["mime"], type=3, desc="", data=cover["data"])])
+        tags.save(path, v1=0, v2_version=3)  # v1=0: 删掉 ID3v1（老 MP3 里常是 GBK 编码，最容易乱码）
+
+    elif ext == ".m4a":
+        from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
+        audio = MP4(path)
+        if audio.tags is None:
+            audio.add_tags()
+        for key, value in (("\xa9nam", f["title"]), ("\xa9ART", f["artist"]), ("\xa9alb", f["album"]),
+                           ("aART", f["album_artist"]), ("\xa9day", f["date"]), ("\xa9gen", f["genre"]),
+                           ("\xa9lyr", f["lyrics"])):
+            if value:
+                audio[key] = [value]
+        if f["label"]:
+            audio["----:com.apple.iTunes:LABEL"] = [MP4FreeForm(f["label"].encode("utf-8"))]
+        if track:
+            audio["trkn"] = [(int(track), int(track_total or 0))]
+        if disc:
+            audio["disk"] = [(int(disc), int(disc_total or 0))]
+        if cover:
+            fmt = MP4Cover.FORMAT_PNG if cover["format"] == "PNG" else MP4Cover.FORMAT_JPEG
+            audio["covr"] = [MP4Cover(cover["data"], imageformat=fmt)]
+        audio.save()
+
+    elif ext == ".ape":
+        from mutagen.apev2 import APEv2, APEValue, BINARY, APENoHeaderError
+        try:
+            tags = APEv2(path)
+        except APENoHeaderError:
+            tags = APEv2()
+        for key, value in (("Title", f["title"]), ("Artist", f["artist"]), ("Album", f["album"]),
+                           ("Album Artist", f["album_artist"]), ("Year", f["date"]), ("Genre", f["genre"]),
+                           ("Label", f["label"]), ("Lyrics", f["lyrics"])):
+            if value:
+                tags[key] = value
+        if track:
+            tags["Track"] = f"{track}/{track_total}" if track_total else str(track)
+        if disc:
+            tags["Disc"] = f"{disc}/{disc_total}" if disc_total else str(disc)
+        if cover:
+            name = b"cover.png" if cover["format"] == "PNG" else b"cover.jpg"
+            tags["Cover Art (Front)"] = APEValue(name + b"\x00" + cover["data"], BINARY)
+        tags.save(path)
+
+
+def _read_back(path: Path, ext: str) -> dict:
+    """从文件里读回标题、歌手、专辑和封面，用来确认写进去的东西完好"""
+    import mutagen
+    audio = mutagen.File(path)
+    tags = audio.tags or {}
+
+    def first(key):
+        v = tags.get(key)
+        if v is None:
+            return ""
+        if hasattr(v, "text"):  # ID3 frame
+            return str(v.text[0]) if v.text else ""
+        if isinstance(v, list):
+            return str(v[0]) if v else ""
+        return str(v)
+
+    if ext == ".flac":
+        out = {"title": first("title"), "artist": first("artist"), "album": first("album"),
+               "cover": audio.pictures[0].data if audio.pictures else None}
+    elif ext == ".mp3":
+        apic = tags.getall("APIC")
+        out = {"title": first("TIT2"), "artist": first("TPE1"), "album": first("TALB"),
+               "cover": apic[0].data if apic else None}
+    elif ext == ".m4a":
+        covr = tags.get("covr")
+        out = {"title": first("\xa9nam"), "artist": first("\xa9ART"), "album": first("\xa9alb"),
+               "cover": bytes(covr[0]) if covr else None}
+    else:
+        art = tags.get("Cover Art (Front)")
+        out = {"title": first("Title"), "artist": first("Artist"), "album": first("Album"),
+               "cover": art.value.split(b"\x00", 1)[1] if art else None}
+    out["length"] = audio.info.length
+    return out
+
+
+def _decode_check(path: Path, audio, expected: float) -> tuple[str, str] | None:
+    """
+    用 ffmpeg 把音频完整解码一遍，返回 (问题描述, 用了什么检查)，问题描述为空串表示没问题；没装 ffmpeg 返回 None。
+
+    FLAC 自带整段音频的 MD5，解码后比对它就能确认逐位无损（等同 `flac -t`）。
+    不看 ffmpeg 的报错：QQ 的部分 FLAC 会让 ffmpeg 的解析器在曲尾误报 "invalid sync code"，
+    但解码结果和 MD5 完全一致。其他格式没有内置校验值，看解码报错 + 实际解码出的时长
+    （截断的 MP3 头里的 Xing 帧照样写着完整时长，ffmpeg 解到结尾也不报错，只能数解出来的采样）。
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    info = audio.info
+    raw_fmt = {8: "s8", 16: "s16le", 24: "s24le", 32: "s32le"}.get(getattr(info, "bits_per_sample", 0))
+    if getattr(info, "md5_signature", 0) and raw_fmt:
+        p = subprocess.Popen([ffmpeg, "-nostdin", "-v", "quiet", "-i", str(path), "-map", "0:a", "-f", raw_fmt, "-"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        md5, size = hashlib.md5(), 0
+        for chunk in iter(lambda: p.stdout.read(1 << 20), b""):
+            md5.update(chunk)
+            size += len(chunk)
+        p.wait()
+        samples = size // (info.channels * info.bits_per_sample // 8)
+        if samples != info.total_samples:
+            return f"只解码出 {samples} 个采样，文件头记录的是 {info.total_samples} 个", "FLAC MD5"
+        if md5.digest() != info.md5_signature.to_bytes(16, "big"):
+            return "解码出的音频和 FLAC 自带的 MD5 对不上", "FLAC MD5"
+        return "", "解码后与 FLAC 自带 MD5 一致（逐位无损）"
+
+    # 降到 8 kHz 单声道 16 bit 只为数时长，每秒 16000 字节
+    p = subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-i", str(path), "-map", "0:a",
+                        "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], capture_output=True)
+    errors = p.stderr.decode("utf-8", "replace").strip()
+    if p.returncode != 0 or errors:
+        return (errors.splitlines()[0] if errors else f"ffmpeg 退出码 {p.returncode}")[:200], "ffmpeg 解码"
+    decoded = len(p.stdout) / 16000
+    target = expected or info.length
+    if decoded < target - 3:
+        return f"只解码出 {decoded:.0f} 秒，应为 {target:.0f} 秒", "ffmpeg 解码"
+    return "", "ffmpeg 完整解码无报错、时长完整"
+
+
+def check_audio(path: Path, meta: dict) -> tuple[str, str]:
+    """
+    检查音频本身：能被识别、时长对得上（不是试听片段）、能完整解码。
+    返回 (问题描述, 做了哪种解码检查)，问题描述为空串表示没问题。
+    """
+    import mutagen
+    try:
+        audio = mutagen.File(path)
+    except Exception as e:
+        return f"无法解析音频: {e}", ""
+    if audio is None:
+        return "无法识别的音频格式（可能下载到的是错误页面）", ""
+    expected = meta.get("duration") or 0
+    if expected and audio.info.length < expected - 3:
+        return f"时长只有 {audio.info.length:.0f} 秒，应为 {expected} 秒（可能是试听片段或文件不完整）", ""
+    decoded = _decode_check(path, audio, expected)
+    if decoded is None:
+        return "", "未装 ffmpeg，跳过完整解码"
+    problem, how = decoded
+    return (f"音频解码出错: {problem}" if problem else ""), how
+
+
+def verify_tags(path: Path, ext: str, meta: dict, cover: dict | None) -> list[str]:
+    """回读标签和封面，确认和写进去的一致"""
+    problems = []
+    try:
+        got = _read_back(path, ext)
+    except Exception as e:
+        return [f"写完标签后文件读不出来: {e}"]
+    f = _tag_fields(meta)
+    for key, label in (("title", "歌名"), ("artist", "歌手"), ("album", "专辑")):
+        if f[key] and got[key] != f[key]:
+            problems.append(f"{label}标签回读不一致: {got[key]!r}")
+    if cover:
+        if got["cover"] != cover["data"]:
+            problems.append("封面没有完整写进文件")
+        elif not inspect_image(got["cover"]):
+            problems.append("文件里的封面解码失败")
+    return problems
+
+
+def _meta_summary(meta: dict, cover: dict | None) -> str:
+    parts = [meta["album"] or "无专辑"]
+    if meta.get("track"):
+        parts.append(f"第 {meta['track']}/{meta['track_total']} 轨" if meta.get("track_total") else f"第 {meta['track']} 轨")
+    if (meta.get("disc_total") or 0) > 1:
+        parts.append(f"第 {meta['disc']}/{meta['disc_total']} 张碟")
+    parts += [x for x in (meta.get("date"), meta.get("genre")) if x]
+    parts.append("歌词 ✓" if meta.get("lyrics") else "无歌词")
+    parts.append(f"封面 {cover['width']}×{cover['height']} {cover['format']}（{cover['source']}）" if cover else "无封面")
+    return " · ".join(parts)
 
 
 def format_duration(seconds: int) -> str:
@@ -812,14 +1518,28 @@ def interactive_search(api: QQMusicAPI, quality: str):
 
 
 def download_song(api: QQMusicAPI, song: dict, quality: str):
-    """下载单首歌曲"""
+    """
+    下载单首歌曲：下到 .part 临时文件 → 检查音频 → 写标签和封面 → 回读校验 → 改成正式文件名。
+    任何一步不过关都不会留下正式文件，所以"已存在就跳过"跳过的一定是完整的文件。
+    """
     mid = song["mid"]
-    name = song["name"]
-    singer = song["singer"]
+    meta = api.get_song_meta(mid)
+    if not meta:
+        print("  ⚠️ 拿不到歌曲详情，只能写入搜索结果里的基本信息")
+        meta = {
+            "mid": mid, "title": song["name"], "artists": [song["singer"]], "singer_mids": [],
+            "album": song.get("album", ""), "album_mid": song.get("album_mid", ""), "album_artists": [song["singer"]],
+            "track": None, "track_total": None, "disc": None, "disc_total": None,
+            "date": "", "genre": "", "label": "", "lyrics": "", "duration": song.get("duration", 0),
+        }
+    name = meta["title"] or song["name"]
+    singer = ", ".join(meta["artists"]) or song["singer"]
 
     quality_info = QUALITY_MAP.get(quality, QUALITY_MAP["320"])
-    filename = sanitize_filename(f"{singer} - {name}{quality_info['ext']}")
+    ext = quality_info["ext"]
+    filename = sanitize_filename(f"{singer} - {name}{ext}")
     output_path = DOWNLOAD_DIR / filename
+    part_path = output_path.with_name(f"{output_path.stem}.part{ext}")
 
     if output_path.exists() and output_path.stat().st_size > 0:
         print(f"  ⏭️  已存在: {filename}")
@@ -831,13 +1551,44 @@ def download_song(api: QQMusicAPI, song: dict, quality: str):
     if not url:
         return
 
+    problem = ""
+    for attempt in (1, 2):
+        try:
+            download_file(url, part_path)
+            problem, _ = check_audio(part_path, meta)
+        except Exception as e:
+            problem = f"下载失败: {e}"
+        if not problem:
+            break
+        if attempt == 1:
+            print(f"  ⚠️ {problem}，重新下载一次...")
+    if problem:
+        print(f"  ❌ {problem}")
+        part_path.unlink(missing_ok=True)
+        return
+
+    cover = api.fetch_cover(meta)
+    if not cover:
+        print("  ⚠️ 没找到合格的封面图（专辑和歌手都没有可用的高清图），文件里不会有封面")
+
+    how = ""
     try:
-        download_file(url, output_path)
-        print(f"  ✅ 已保存: {output_path}")
+        embed_metadata(part_path, ext, meta, cover)
+        problems = verify_tags(part_path, ext, meta, cover)
+        after, how = check_audio(part_path, meta)  # 写标签后再验一次，确认没把音频写坏
+        if after:
+            problems.append(f"写完标签后{after}")
     except Exception as e:
-        print(f"  ❌ 下载失败: {e}")
-        if output_path.exists():
-            output_path.unlink()
+        problems = [f"写标签失败: {e}"]
+    if problems:
+        print(f"  ❌ 元数据校验没通过: {'; '.join(problems)}")
+        part_path.unlink(missing_ok=True)
+        return
+
+    part_path.replace(output_path)
+    print(f"  🏷️  {_meta_summary(meta, cover)}")
+    print(f"  🔍 校验通过：大小与服务器一致 · 时长 {format_duration(meta['duration'])} · {how} · 标签和封面回读一致")
+    print(f"  ✅ 已保存: {output_path}")
 
 
 def interactive_playlists(api: QQMusicAPI, quality: str):
@@ -884,6 +1635,8 @@ def main():
     parser.add_argument("query", nargs="?", default="", help="搜索关键词 / songMid / 歌单ID")
     parser.add_argument("--quality", "-q", default="320", choices=list(QUALITY_MAP.keys()), help="音质 (128/320/flac/ape/m4a)")
     parser.add_argument("--login", action="store_true", help="强制重新登录")
+    parser.add_argument("--login-type", choices=["qq", "wx"], default=None,
+                        help="扫码登录方式: qq=手机 QQ, wx=微信。默认沿用上次的登录方式，没登录过则用 qq")
     parser.add_argument("--cookie", type=str, help="直接传入 Cookie 字符串")
     parser.add_argument("--index", "-i", type=int, default=None, help="仅下载 search 结果中的第 N 条 (1-based)，用于非交互调用")
     parser.add_argument("--first", action="store_true", help="仅下载 search 结果中的第 1 条，等价于 --index 1")
@@ -898,6 +1651,13 @@ def main():
     # 初始化
     cm = CookieManager()
     api = QQMusicAPI(cm)
+    loaded = cm.load()
+    login_type = args.login_type or (cm.login_type if loaded and cm.is_logged_in else "qq")
+
+    def do_login() -> bool:
+        if login_type == "wx":
+            return WxQrLogin(cm, api).login()
+        return QQrLogin(cm).login()
 
     # 加载或获取 Cookie
     if args.cookie:
@@ -909,19 +1669,20 @@ def main():
                 k, v = part.split("=", 1)
                 cookie_dict[k.strip()] = v.strip()
         cm.set(cookie_dict)
-    elif args.login or not cm.load() or not cm.is_logged_in:
+    elif args.login or not loaded or not cm.is_logged_in:
         # 需要登录
-        qr_login = QQrLogin(cm)
-        if not qr_login.login():
+        if not do_login():
             print("\n❌ 登录失败")
             sys.exit(1)
+    else:
+        api.ensure_fresh_login()
 
     if args.login and not args.command:
         # 非交互登录: 不带子命令时登录完成即退出, 不进入交互菜单
-        print(f"\n✅ 登录完成, Cookie 已保存: QQ {cm.uin}")
+        print(f"\n✅ 登录完成, Cookie 已保存: {cm.account_label}")
         sys.exit(0)
 
-    print(f"\n✅ 当前登录: QQ {cm.uin}")
+    print(f"\n✅ 当前登录: {cm.account_label}")
     print(f"   音质选择: {QUALITY_MAP[args.quality]['label']}")
 
     # 执行命令
@@ -1000,8 +1761,7 @@ def main():
                     args.quality = q
                     print(f"✅ 已切换到 {QUALITY_MAP[q]['label']}")
             elif choice == "4":
-                qr_login = QQrLogin(cm)
-                qr_login.login()
+                do_login()
             elif choice in ("5", "q", "quit"):
                 print("👋 再见！")
                 break
