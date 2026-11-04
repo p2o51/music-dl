@@ -1313,7 +1313,7 @@ def _tag_fields(meta: dict) -> dict:
 
 
 def _extra_tags(meta: dict) -> dict:
-    """只有全景声版才有的标签：专辑版本和 ReplayGain"""
+    """专辑版本（只有全景声版有）和曲目 ReplayGain"""
     extra = {}
     if meta.get("album_version"):
         extra["ALBUMVERSION"] = meta["album_version"]
@@ -1332,15 +1332,106 @@ def measure_replaygain(path: Path) -> tuple[float, float] | None:
     """用 ffmpeg 的 EBU R128 量整首响度，换算成 ReplayGain 2.0 的增益和采样峰值。没装 ffmpeg 返回 None"""
     if not shutil.which("ffmpeg"):
         return None
-    out = subprocess.run(["ffmpeg", "-nostats", "-hide_banner", "-i", str(path), "-af", "ebur128=peak=sample",
-                          "-f", "null", "-"], capture_output=True, text=True).stderr
+    measured = _loudness(["-i", str(path), "-af", "ebur128=peak=sample", "-f", "null", "-"])
+    return (REPLAYGAIN_REFERENCE - measured[0], measured[1]) if measured else None
+
+
+def _loudness(args: list[str]) -> tuple[float, float] | None:
+    """跑一遍 ffmpeg ebur128，返回 (整体响度 LUFS, 采样峰值线性值)"""
+    out = subprocess.run(["ffmpeg", "-nostats", "-hide_banner", *args], capture_output=True, text=True,
+                         errors="replace").stderr
     summary = out[out.rfind("Summary:"):]
     loud = re.search(r"I:\s+(-?[\d.]+) LUFS", summary)
     peak = re.search(r"Peak:\s+(-?[\d.]+|-inf) dBFS", summary)
     if not loud:
         return None
     peak_db = float(peak.group(1)) if peak and peak.group(1) != "-inf" else 0.0
-    return REPLAYGAIN_REFERENCE - float(loud.group(1)), 10 ** (peak_db / 20)
+    return float(loud.group(1)), 10 ** (peak_db / 20)
+
+
+def _write_replaygain(path: Path, tags: dict):
+    """只改 ReplayGain 这几个标签，其他标签和音频不动"""
+    ext = path.suffix.lower()
+    if ext == ".flac":
+        from mutagen.flac import FLAC
+        audio = FLAC(path)
+        for key, value in tags.items():
+            audio[key] = value
+        audio.save()
+    elif ext == ".mp3":
+        from mutagen.id3 import ID3, TXXX, Encoding
+        id3 = ID3(path)
+        for key, value in tags.items():
+            id3.setall(f"TXXX:{key}", [TXXX(encoding=Encoding.UTF16, desc=key, text=value)])
+        id3.save(path, v1=0, v2_version=3, v23_sep=None)  # 和 embed_metadata 一样存成 v2.3
+    elif ext == ".m4a":
+        from mutagen.mp4 import MP4, MP4FreeForm
+        audio = MP4(path)
+        for key, value in tags.items():
+            audio[f"----:com.apple.iTunes:{key}"] = [MP4FreeForm(value.encode("utf-8"))]
+        audio.save()
+    elif ext == ".ape":
+        from mutagen.apev2 import APEv2
+        ape = APEv2(path)
+        for key, value in tags.items():
+            ape[key] = value
+        ape.save(path)
+
+
+def _read_tag(path: Path, key: str) -> str:
+    import mutagen
+    tags = mutagen.File(path).tags or {}
+    for k in (key, f"TXXX:{key}", f"----:com.apple.iTunes:{key}"):
+        if k in tags:
+            v = tags[k]
+            v = v.text[0] if hasattr(v, "text") else v  # MP3 的 TXXX 帧
+            v = v[0] if isinstance(v, list) else v
+            return v.decode("utf-8") if isinstance(v, bytes) else str(v)  # MP4 自定义标签读回来是 bytes
+    return ""
+
+
+def write_album_replaygain(paths: list[Path]) -> bool:
+    """
+    给一整张立体声专辑写专辑增益：把所有曲目统一成 48 kHz 立体声接起来量一次响度，峰值取各首最大值。
+    曲目增益也按同一次测量重写一遍，已存在的旧文件也能补上。
+    全景声版不调用这个：杜比和臻品全景声响度差约 10 dB，用一个专辑增益拉不平。
+    """
+    if not shutil.which("ffmpeg"):
+        print("  ⚠️ 没装 ffmpeg，不写专辑增益")
+        return False
+    tracks = [_loudness(["-i", str(p), "-map", "0:a:0", "-af", "ebur128=peak=sample", "-f", "null", "-"])
+              for p in paths]
+    ins = [a for p in paths for a in ("-i", str(p))]
+    chains = [f"[{n}:a:0]aresample=48000,aformat=sample_fmts=flt:channel_layouts=stereo[a{n}]"
+              for n in range(len(paths))]
+    graph = ";".join(chains) + ";" + "".join(f"[a{n}]" for n in range(len(paths))) + \
+        f"concat=n={len(paths)}:v=0:a=1,ebur128=peak=sample[out]"
+    album = _loudness([*ins, "-filter_complex", graph, "-map", "[out]", "-f", "null", "-"])
+    if album is None or None in tracks:
+        print("  ⚠️ 量不出响度，不写专辑增益")
+        return False
+    album_gain = f"{REPLAYGAIN_REFERENCE - album[0]:+.2f} dB"
+    album_peak = f"{max(t[1] for t in tracks):.6f}"
+    for path, (loud, peak) in zip(paths, tracks):
+        tags = {
+            "REPLAYGAIN_TRACK_GAIN": f"{REPLAYGAIN_REFERENCE - loud:+.2f} dB",
+            "REPLAYGAIN_TRACK_PEAK": f"{peak:.6f}",
+            "REPLAYGAIN_ALBUM_GAIN": album_gain,
+            "REPLAYGAIN_ALBUM_PEAK": album_peak,
+        }
+        part = path.with_name(f"{path.stem}.part{path.suffix}")
+        shutil.copy2(path, part)  # 在副本上改，回读一致再换回去，改坏了原文件还在
+        try:
+            _write_replaygain(part, tags)
+            if any(_read_tag(part, k) != v for k, v in tags.items()):
+                raise ValueError("回读不一致")
+        except Exception as e:
+            part.unlink(missing_ok=True)
+            print(f"  ❌ {path.name} 写专辑增益失败: {e}")
+            return False
+        part.replace(path)
+    print(f"  🔊 专辑响度 {album[0]:.1f} LUFS，专辑增益 {album_gain}，{len(paths)} 首都已写入")
+    return True
 
 
 def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
@@ -1658,11 +1749,12 @@ def song_path(meta: dict, ext: str, layout: str) -> Path:
     return DOWNLOAD_DIR / sanitize_filename(f"{singer} - {title}{ext}")
 
 
-def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat") -> str:
+def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat",
+                  saved: list[Path] | None = None) -> str:
     """
     下载单首歌曲：下到 .part 临时文件 → 检查音频 → 写标签和封面 → 回读校验 → 改成正式文件名。
     任何一步不过关都不会留下正式文件，所以"已存在就跳过"跳过的一定是完整的文件。
-    返回 "ok" / "skip" / "fail"。
+    返回 "ok" / "skip" / "fail"。传了 saved 时，下好或已存在的文件路径会加进去。
     """
     mid = song["mid"]
     meta = api.get_song_meta(mid)
@@ -1683,6 +1775,8 @@ def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat
         existing = song_path(meta, QUALITY_MAP[q]["ext"], layout)
         if existing.exists() and existing.stat().st_size > 0:
             print(f"  ⏭️  已存在: {existing.relative_to(DOWNLOAD_DIR)}")
+            if saved is not None:
+                saved.append(existing)
             return "skip"
 
     print(f"  🎵 {singer} - {name} [{quality_label(quality)}]")
@@ -1699,7 +1793,11 @@ def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat
     quality_info = QUALITY_MAP[q]
     if len(candidates) > 1:
         print(f"  🎚️  音质：{quality_info['label']}")
-    return _save_track(api, url, song_path(meta, quality_info["ext"], layout), meta)
+    output_path = song_path(meta, quality_info["ext"], layout)
+    result = _save_track(api, url, output_path, meta)
+    if result == "ok" and saved is not None:
+        saved.append(output_path)
+    return result
 
 
 def _save_track(api: QQMusicAPI, url: str, output_path: Path, meta: dict) -> str:
@@ -1730,8 +1828,7 @@ def _save_track(api: QQMusicAPI, url: str, output_path: Path, meta: dict) -> str
 
     how = ""
     try:
-        if meta.get("album_version"):
-            meta = {**meta, "replaygain": measure_replaygain(part_path)}
+        meta = {**meta, "replaygain": measure_replaygain(part_path)}
         embed_metadata(part_path, ext, meta, cover)
         problems = verify_tags(part_path, ext, meta, cover)
         after, how = check_audio(part_path, meta)  # 写标签后再验一次，确认没把音频写坏
@@ -1981,11 +2078,15 @@ def main():
             print("❌ 拿不到这张专辑的曲目")
             sys.exit(1)
         print(f"\n💿 专辑《{album_name}》共 {len(songs)} 首")
-        results = []
+        results, saved = [], []
         for i, song in enumerate(songs, 1):
             print(f"\n[{i}/{len(songs)}]", end="")
-            results.append(download_song(api, song, args.quality, layout))
+            results.append(download_song(api, song, args.quality, layout, saved))
         print(f"\n💿 《{album_name}》：✅ 新下载 {results.count('ok')} 首 · ⏭️ 已存在 {results.count('skip')} 首 · ❌ 失败 {results.count('fail')} 首")
+        if "fail" in results:
+            print("  ⚠️ 专辑没下全，不写专辑增益（补下完再跑一次就会写）")
+        elif "ok" in results:
+            write_album_replaygain(saved)
         if args.spatial:
             spatial = download_spatial_album(api, songs)
             if spatial is None:
