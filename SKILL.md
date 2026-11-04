@@ -51,6 +51,8 @@ python3 ~/.claude/skills/music-dl/qq_dl.py album 0012uuSI1sJa2m --quality best
 
 也可以直接 `album "关键词" --first` / `--index N`。专辑按光盘、音轨顺序下载，最后打印一行汇总：`💿 《专辑名》：✅ 新下载 N 首 · ⏭️ 已存在 N 首 · ❌ 失败 N 首`，有失败时退出码为 2。
 
+**全景声版**：`album <albumMid> --quality best --spatial` 先照常下立体声版。专辑里有杜比全景声时，再另存一份完整的 `专辑名（全景声）/`：有杜比的歌用杜比原版，没有的用 QQ 算出来的臻品全景声 5.1，都没有的用立体声补齐。专辑里没有杜比全景声就不存。用户要「全景声版」时加 `--spatial`。
+
 `album` 命令默认按专辑分文件夹：`专辑名/01 歌名.flac`，多碟专辑是 `专辑名/1-01 歌名.flac`。其他命令默认平铺成 `歌手 - 歌名.flac`。用 `--layout album` / `--layout flat` 可以改。
 
 ### 下载歌单

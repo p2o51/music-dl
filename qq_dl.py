@@ -72,6 +72,18 @@ QUALITY_MAP = {
 BEST_ORDER = ["flac", "320", "128"]
 BEST_LABEL = "最佳（无损优先，没有就退到 320 / 128）"
 
+# album --spatial 另存的全景声版用到的文件，不在 --quality 里。
+# 杜比全景声是唱片公司交付的单独混音（服务器上是 .mp4，存成 .m4a）；臻品全景声是 QQ 从立体声成品算出来的
+SPATIAL_MAP = {
+    "dolby768": {"prefix": "D003", "ext": ".m4a", "remote_ext": ".mp4", "label": "杜比全景声 768k"},
+    "dolby640": {"prefix": "D002", "ext": ".m4a", "remote_ext": ".mp4", "label": "杜比全景声 640k"},
+    "dolby448": {"prefix": "D001", "ext": ".m4a", "remote_ext": ".mp4", "label": "杜比全景声 448k"},
+    "atmos51": {"prefix": "Q001", "ext": ".flac", "label": "臻品全景声 5.1 FLAC"},
+}
+SPATIAL_DOLBY = ["dolby768", "dolby640", "dolby448"]
+SPATIAL_VERSION = "全景声"  # 写进 ALBUMVERSION，Navidrome 据此把它当成同名专辑的另一个版本
+REPLAYGAIN_REFERENCE = -18.0  # LUFS；杜比版按规范做在 -18 左右，臻品全景声跟立体声一样在 -9 左右，混在一张专辑里要靠它拉平
+
 
 def quality_label(quality: str) -> str:
     return BEST_LABEL if quality == "best" else QUALITY_MAP[quality]["label"]
@@ -835,7 +847,7 @@ class QQMusicAPI:
         获取指定音质的下载 URL。这首歌没有这个音质时返回 None，不会拿别的音质顶替，
         原因写在 self.last_url_problem 里（quiet=False 时也直接打印出来）。
         """
-        quality_info = QUALITY_MAP.get(quality, QUALITY_MAP["320"])
+        quality_info = QUALITY_MAP.get(quality) or SPATIAL_MAP.get(quality) or QUALITY_MAP["320"]
         self.last_url_problem = ""
 
         def fail(problem: str) -> None:
@@ -893,7 +905,7 @@ class QQMusicAPI:
 
         # 第二次请求: 指定目标品质的 filename
         if media_mid and quality != "m4a":
-            filename = f"{quality_info['prefix']}{media_mid}{quality_info['ext']}"
+            filename = f"{quality_info['prefix']}{media_mid}{quality_info.get('remote_ext', quality_info['ext'])}"
 
             data_second = {
                 "req_0": {
@@ -985,6 +997,7 @@ class QQMusicAPI:
             "label": next(iter(info_values("company")), ""),
             "lyrics": _decode_lyric(r.get("lyric")),
             "duration": ti.get("interval", 0),
+            "file": ti.get("file") or {},  # 各档音质的文件大小，0 = 没有这一档
         }
 
         if meta["album_mid"]:
@@ -1299,6 +1312,37 @@ def _tag_fields(meta: dict) -> dict:
     }
 
 
+def _extra_tags(meta: dict) -> dict:
+    """只有全景声版才有的标签：专辑版本和 ReplayGain"""
+    extra = {}
+    if meta.get("album_version"):
+        extra["ALBUMVERSION"] = meta["album_version"]
+        # Navidrome 按「专辑艺人 + 专辑名 + 版本 + 发行日期」认专辑。M4A 的 ©day 它会同时当发行日期，
+        # FLAC / MP3 的日期不会，混在一张全景声专辑里就会被拆成两张，所以这里显式写上
+        if meta.get("date"):
+            extra["RELEASEDATE"] = meta["date"]
+    if meta.get("replaygain"):
+        gain, peak = meta["replaygain"]
+        extra["REPLAYGAIN_TRACK_GAIN"] = f"{gain:+.2f} dB"
+        extra["REPLAYGAIN_TRACK_PEAK"] = f"{peak:.6f}"
+    return extra
+
+
+def measure_replaygain(path: Path) -> tuple[float, float] | None:
+    """用 ffmpeg 的 EBU R128 量整首响度，换算成 ReplayGain 2.0 的增益和采样峰值。没装 ffmpeg 返回 None"""
+    if not shutil.which("ffmpeg"):
+        return None
+    out = subprocess.run(["ffmpeg", "-nostats", "-hide_banner", "-i", str(path), "-af", "ebur128=peak=sample",
+                          "-f", "null", "-"], capture_output=True, text=True).stderr
+    summary = out[out.rfind("Summary:"):]
+    loud = re.search(r"I:\s+(-?[\d.]+) LUFS", summary)
+    peak = re.search(r"Peak:\s+(-?[\d.]+|-inf) dBFS", summary)
+    if not loud:
+        return None
+    peak_db = float(peak.group(1)) if peak and peak.group(1) != "-inf" else 0.0
+    return REPLAYGAIN_REFERENCE - float(loud.group(1)), 10 ** (peak_db / 20)
+
+
 def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
     """把标签和封面写进音频文件。保留文件里原有的其他标签（比如 M4A 的无缝播放信息）"""
     f = _tag_fields(meta)
@@ -1318,6 +1362,8 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
         for key, value in vorbis.items():
             if value:
                 audio[key] = str(value)
+        for key, value in _extra_tags(meta).items():
+            audio[key] = value
         if len(artists) > 1:
             audio["ARTISTS"] = artists  # 多值字段，Navidrome / Picard 等按这个拆分歌手
         elif "ARTISTS" in audio:
@@ -1356,6 +1402,8 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
             tags.delall("TXXX:ARTISTS")
         if f["lyrics"]:
             tags.setall("USLT", [USLT(encoding=enc, lang="XXX", desc="", text=f["lyrics"])])
+        for key, value in _extra_tags(meta).items():
+            tags.setall(f"TXXX:{key}", [TXXX(encoding=enc, desc=key, text=value)])
         if cover:
             tags.setall("APIC", [APIC(encoding=enc, mime=cover["mime"], type=3, desc="", data=cover["data"])])
         # v1=0: 删掉 ID3v1（老 MP3 里常是 GBK 编码，最容易乱码）
@@ -1374,6 +1422,8 @@ def embed_metadata(path: Path, ext: str, meta: dict, cover: dict | None):
                 audio[key] = [value]
         if f["label"]:
             audio["----:com.apple.iTunes:LABEL"] = [MP4FreeForm(f["label"].encode("utf-8"))]
+        for key, value in _extra_tags(meta).items():
+            audio[f"----:com.apple.iTunes:{key}"] = [MP4FreeForm(value.encode("utf-8"))]
         if len(artists) > 1:
             audio["----:com.apple.iTunes:ARTISTS"] = [MP4FreeForm(a.encode("utf-8")) for a in artists]
         else:
@@ -1647,10 +1697,14 @@ def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat
             print(f"  ⚠️ {api.last_url_problem}")
         return "fail"
     quality_info = QUALITY_MAP[q]
-    ext = quality_info["ext"]
     if len(candidates) > 1:
         print(f"  🎚️  音质：{quality_info['label']}")
-    output_path = song_path(meta, ext, layout)
+    return _save_track(api, url, song_path(meta, quality_info["ext"], layout), meta)
+
+
+def _save_track(api: QQMusicAPI, url: str, output_path: Path, meta: dict) -> str:
+    """下到 .part → 检查音频 → 写标签和封面 → 回读校验 → 改成正式文件名。返回 "ok" / "fail" """
+    ext = output_path.suffix
     output_path.parent.mkdir(parents=True, exist_ok=True)
     part_path = output_path.with_name(f"{output_path.stem}.part{ext}")
 
@@ -1676,11 +1730,15 @@ def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat
 
     how = ""
     try:
+        if meta.get("album_version"):
+            meta = {**meta, "replaygain": measure_replaygain(part_path)}
         embed_metadata(part_path, ext, meta, cover)
         problems = verify_tags(part_path, ext, meta, cover)
         after, how = check_audio(part_path, meta)  # 写标签后再验一次，确认没把音频写坏
         if after:
             problems.append(f"写完标签后{after}")
+        if meta.get("album_version") and _read_album_version(part_path) != meta["album_version"]:
+            problems.append("专辑版本标签回读不一致")
     except Exception as e:
         problems = [f"写标签失败: {e}"]
     if problems:
@@ -1693,6 +1751,70 @@ def download_song(api: QQMusicAPI, song: dict, quality: str, layout: str = "flat
     print(f"  🔍 校验通过：大小与服务器一致 · 时长 {format_duration(meta['duration'])} · {how} · 标签和封面回读一致")
     print(f"  ✅ 已保存: {output_path}")
     return "ok"
+
+
+def _read_album_version(path: Path) -> str:
+    import mutagen
+    tags = mutagen.File(path).tags or {}
+    for key in ("ALBUMVERSION", "TXXX:ALBUMVERSION", "----:com.apple.iTunes:ALBUMVERSION"):
+        if key in tags:
+            v = tags[key]
+            v = v[0] if isinstance(v, list) else v
+            return v.decode("utf-8") if isinstance(v, bytes) else str(v)  # MP4 自定义标签读回来是 bytes
+    return ""
+
+
+def _remote_exists(url: str) -> bool:
+    """取链接接口对没有的文件有时也给链接（比如 RS01），要到 CDN 上确认一下"""
+    try:
+        r = requests.get(url, headers={"User-Agent": UA, "Referer": REFERER, "Range": "bytes=0-0"}, timeout=15)
+        return r.status_code in (200, 206)
+    except requests.RequestException:
+        return False
+
+
+def download_spatial_album(api: QQMusicAPI, songs: list[dict]) -> list[str] | None:
+    """
+    专辑里有杜比全景声时，另存一份完整的全景声版到「专辑名（全景声）/」，标签写 ALBUMVERSION=全景声。
+    每首按 杜比全景声 → 臻品全景声 5.1 → 立体声（无损 / 320 / 128）取第一个有的，保证这一版也是整张专辑。
+    专辑里一首杜比全景声都没有时返回 None，不存这一版。
+    """
+    metas = [api.get_song_meta(s["mid"]) for s in songs]
+    if not any(m and m["file"].get("size_dolby") for m in metas):
+        return None
+    results = []
+    for i, (song, meta) in enumerate(zip(songs, metas), 1):
+        print(f"\n[全景声 {i}/{len(songs)}]", end="")
+        results.append(_download_spatial_track(api, song, meta))
+    return results
+
+
+def _download_spatial_track(api: QQMusicAPI, song: dict, meta: dict | None) -> str:
+    if not meta:
+        print(f"  ❌ 拿不到《{song['name']}》的歌曲详情")
+        return "fail"
+    meta = {**meta, "album_version": SPATIAL_VERSION}
+    folder_meta = {**meta, "album": f"{meta['album']}（{SPATIAL_VERSION}）"}  # 只改文件夹名，ALBUM 标签不变
+    sizes = meta["file"]
+    candidates = (SPATIAL_DOLBY if sizes.get("size_dolby") else []) + \
+                 (["atmos51"] if (sizes.get("size_new") or [0, 0, 0])[2] else []) + BEST_ORDER
+    for ext in {(SPATIAL_MAP.get(q) or QUALITY_MAP[q])["ext"] for q in candidates}:
+        existing = song_path(folder_meta, ext, "album")
+        if existing.exists() and existing.stat().st_size > 0:
+            print(f"  ⏭️  已存在: {existing.relative_to(DOWNLOAD_DIR)}")
+            return "skip"
+
+    print(f"  🎵 {', '.join(meta['artists'])} - {meta['title']} [全景声版]")
+    for q in candidates:
+        url = api.get_song_url(meta["mid"], q, quiet=True)
+        if url and _remote_exists(url):
+            break
+    else:
+        print("  ⚠️ 这首歌没有任何可下载的音源")
+        return "fail"
+    info = SPATIAL_MAP.get(q) or QUALITY_MAP[q]
+    print(f"  🎚️  音质：{info['label']}" + ("（没有全景声，用立体声补齐）" if q in BEST_ORDER else ""))
+    return _save_track(api, url, song_path(folder_meta, info["ext"], "album"), meta)
 
 
 def interactive_playlists(api: QQMusicAPI, quality: str):
@@ -1748,6 +1870,8 @@ def main():
     parser.add_argument("--index", "-i", type=int, default=None, help="仅下载 search 结果中的第 N 条 (1-based)，用于非交互调用")
     parser.add_argument("--first", action="store_true", help="仅下载 search 结果中的第 1 条，等价于 --index 1")
     parser.add_argument("--output-dir", "-o", type=str, default=None, help="下载输出目录，默认 ~/Music/QQMusic")
+    parser.add_argument("--spatial", action="store_true",
+                        help="album 专用：专辑里有杜比全景声时，另存一份完整的全景声版到「专辑名（全景声）/」")
 
     args = parser.parse_args()
 
@@ -1862,6 +1986,13 @@ def main():
             print(f"\n[{i}/{len(songs)}]", end="")
             results.append(download_song(api, song, args.quality, layout))
         print(f"\n💿 《{album_name}》：✅ 新下载 {results.count('ok')} 首 · ⏭️ 已存在 {results.count('skip')} 首 · ❌ 失败 {results.count('fail')} 首")
+        if args.spatial:
+            spatial = download_spatial_album(api, songs)
+            if spatial is None:
+                print(f"\n🎧 《{album_name}》没有杜比全景声，不存全景声版")
+            else:
+                print(f"\n🎧 《{album_name}（{SPATIAL_VERSION}）》：✅ 新下载 {spatial.count('ok')} 首 · ⏭️ 已存在 {spatial.count('skip')} 首 · ❌ 失败 {spatial.count('fail')} 首")
+                results += spatial
         if "fail" in results:
             sys.exit(2)
 
