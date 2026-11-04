@@ -19,7 +19,7 @@ QQ音乐下载器 - 支持二维码扫码登录 + 会员音质
   --quality 128    标准MP3 128kbps
   --quality 320    HQ MP3 320kbps (需会员)
   --quality flac   FLAC 无损 (需会员)
-  --quality master 臻品母带 FLAC，24 bit / 192 kHz (需超级会员)
+  --quality master 臻品母带 FLAC，24 bit / 192 kHz (需超级会员；是 QQ 用算法从无损加工出来的，不是录音室母带)
   --quality m4a    默认M4A格式
 
 Cookie 保存位置: ~/.qqmusic_cookie.json
@@ -67,9 +67,10 @@ QUALITY_MAP = {
     "ape":  {"prefix": "A000", "ext": ".ape",  "label": "无损 APE"},
     "m4a":  {"prefix": "C400", "ext": ".m4a",  "label": "标准 M4A"},
 }
-# --quality best：按这个顺序取第一个有音源的音质
-BEST_ORDER = ["master", "flac", "320", "128"]
-BEST_LABEL = "最佳（臻品母带优先，没有就依次退到无损 / 320 / 128）"
+# --quality best：按这个顺序取第一个有音源的音质。
+# 不含臻品母带：它和无损在 8 kHz 以下逐采样一致，高频是重新生成的，没有无损的歌甚至是从 320k MP3 算出来的
+BEST_ORDER = ["flac", "320", "128"]
+BEST_LABEL = "最佳（无损优先，没有就退到 320 / 128）"
 
 
 def quality_label(quality: str) -> str:
@@ -1737,7 +1738,7 @@ def main():
     parser.add_argument("command", nargs="?", default="", help="命令: search/搜索, song/歌曲, album/专辑, playlist/歌单")
     parser.add_argument("query", nargs="?", default="", help="搜索关键词 / songMid / albumMid 或专辑关键词 / 歌单ID")
     parser.add_argument("--quality", "-q", default="320", choices=list(QUALITY_MAP.keys()) + ["best"],
-                        help="音质 (128/320/flac/master/ape/m4a；best = 臻品母带优先，没有就依次退到无损 / 320 / 128)")
+                        help="音质 (128/320/flac/master/ape/m4a；best = 无损优先，没有就退到 320 / 128)")
     parser.add_argument("--layout", choices=["flat", "album"], default=None,
                         help="flat = 歌手 - 歌名.flac；album = 专辑名/01 歌名.flac。album 命令默认 album，其他默认 flat")
     parser.add_argument("--login", action="store_true", help="强制重新登录")
