@@ -19,6 +19,7 @@ QQ音乐下载器 - 支持二维码扫码登录 + 会员音质
   --quality 128    标准MP3 128kbps
   --quality 320    HQ MP3 320kbps (需会员)
   --quality flac   FLAC 无损 (需会员)
+  --quality master 臻品母带 FLAC，24 bit / 192 kHz (需超级会员)
   --quality m4a    默认M4A格式
 
 Cookie 保存位置: ~/.qqmusic_cookie.json
@@ -62,12 +63,13 @@ QUALITY_MAP = {
     "128":  {"prefix": "M500", "ext": ".mp3",  "label": "标准 128kbps"},
     "320":  {"prefix": "M800", "ext": ".mp3",  "label": "HQ 320kbps"},
     "flac": {"prefix": "F000", "ext": ".flac", "label": "无损 FLAC"},
+    "master": {"prefix": "AI00", "ext": ".flac", "label": "臻品母带 FLAC"},
     "ape":  {"prefix": "A000", "ext": ".ape",  "label": "无损 APE"},
     "m4a":  {"prefix": "C400", "ext": ".m4a",  "label": "标准 M4A"},
 }
 # --quality best：按这个顺序取第一个有音源的音质
-BEST_ORDER = ["flac", "320", "128"]
-BEST_LABEL = "最佳（无损优先，没有就退到 320 / 128）"
+BEST_ORDER = ["master", "flac", "320", "128"]
+BEST_LABEL = "最佳（臻品母带优先，没有就依次退到无损 / 320 / 128）"
 
 
 def quality_label(quality: str) -> str:
@@ -930,7 +932,9 @@ class QQMusicAPI:
             return None
 
         # 拼接最终 URL
-        domain = sip[1] if len(sip) > 1 else (sip[0] if sip else "https://ws.stream.qqmusic.qq.com/")
+        # sip 里第一个（aqqmusic.tc.qq.com）实测 5–16 MB/s，第二个（sjyN.stream.qqmusic.qq.com）只有约 0.5 MB/s，
+        # 一首 150 MB 的臻品母带要下 5 分钟
+        domain = sip[0] if sip else "https://aqqmusic.tc.qq.com/"
         if not domain.startswith("http"):
             domain = f"https://{domain}"
 
@@ -1733,7 +1737,7 @@ def main():
     parser.add_argument("command", nargs="?", default="", help="命令: search/搜索, song/歌曲, album/专辑, playlist/歌单")
     parser.add_argument("query", nargs="?", default="", help="搜索关键词 / songMid / albumMid 或专辑关键词 / 歌单ID")
     parser.add_argument("--quality", "-q", default="320", choices=list(QUALITY_MAP.keys()) + ["best"],
-                        help="音质 (128/320/flac/ape/m4a；best = 无损优先，没有就退到 320 / 128)")
+                        help="音质 (128/320/flac/master/ape/m4a；best = 臻品母带优先，没有就依次退到无损 / 320 / 128)")
     parser.add_argument("--layout", choices=["flat", "album"], default=None,
                         help="flat = 歌手 - 歌名.flac；album = 专辑名/01 歌名.flac。album 命令默认 album，其他默认 flat")
     parser.add_argument("--login", action="store_true", help="强制重新登录")

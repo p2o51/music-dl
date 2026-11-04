@@ -1,6 +1,6 @@
 # music-dl · QQ 音乐下载器 (Claude Agent Skill)
 
-一个 [Claude Agent Skill](https://docs.claude.com/en/docs/claude-code/skills)，让 AI agent 能搜索并下载 QQ 音乐的歌曲，支持会员音质（FLAC 无损 / 320kbps / 128kbps / M4A）。也可以脱离 agent 当普通命令行工具直接用。
+一个 [Claude Agent Skill](https://docs.claude.com/en/docs/claude-code/skills)，让 AI agent 能搜索并下载 QQ 音乐的歌曲，支持会员音质（臻品母带 / FLAC 无损 / 320kbps / 128kbps / M4A）。也可以脱离 agent 当普通命令行工具直接用。
 
 - **搜索**：中英文歌名、歌手名，走 `musics.fcg` 签名接口（`zzc` 签名），**无需登录即可搜索**。
 - **下载**：按搜索结果、`songMid`、整张专辑或歌单 ID 下载；高音质需要 QQ 音乐会员权限。`--quality best` 每首取能拿到的最高音质。
@@ -57,9 +57,12 @@ python3 qq_dl.py --login --login-type wx  # 微信扫码
 | `128` | 标准 MP3 128kbps |
 | `320` | HQ MP3 320kbps（需会员）|
 | `flac` | FLAC 无损（需会员）|
+| `master` | 臻品母带 FLAC，24 bit / 192 kHz（需超级会员）|
 | `ape` | APE 无损（需会员）|
 | `m4a` | 默认 M4A |
-| `best` | 无损优先，这首没有无损就退到 320，再没有就 128 |
+| `best` | 臻品母带优先，这首没有就依次退到无损、320、128 |
+
+臻品母带的文件约是同一首无损 FLAC 的 3 倍大。它和普通无损不是同一份音频：实测 20 kHz 以上的高频能量明显更多，响度也略高，应该是 QQ 音乐另外处理过的版本。没有超级会员时，`best` 会自动从无损开始。
 
 不指定 `--quality` 时默认 `320`。会员无权限的歌会打印提示并跳过，可降级到 `128` 重试。指定的音质这首歌没有时也会跳过，不会拿别的音质顶替。默认下载到 `~/Music/QQMusic`，用 `--output-dir` 改。
 
