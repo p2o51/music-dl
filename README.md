@@ -1,6 +1,6 @@
 # music-dl · QQ 音乐下载器 (Claude Agent Skill)
 
-一个 [Claude Agent Skill](https://docs.claude.com/en/docs/claude-code/skills)，让 AI agent 能搜索并下载 QQ 音乐的歌曲，支持会员音质（FLAC 无损 / 320kbps / 128kbps / M4A）。也可以脱离 agent 当普通命令行工具直接用。
+一个 [Claude Agent Skill](https://docs.claude.com/en/docs/claude-code/skills)，让 AI agent 能搜索并下载 QQ 音乐的歌曲，支持会员音质（臻品母带 / FLAC 无损 / 320kbps / 128kbps / M4A）。也可以脱离 agent 当普通命令行工具直接用。
 
 - **搜索**：中英文歌名、歌手名，走 `musics.fcg` 签名接口（`zzc` 签名），**无需登录即可搜索**。
 - **下载**：按搜索结果、`songMid`、整张专辑或歌单 ID 下载；高音质需要 QQ 音乐会员权限。`--quality best` 每首取能拿到的最高音质。
@@ -40,6 +40,9 @@ python3 qq_dl.py song <songMid> --quality flac
 python3 qq_dl.py album "伊能静 关不住"
 python3 qq_dl.py album <albumMid> --quality best
 
+# 同上，专辑里有杜比全景声时另存一份全景声版
+python3 qq_dl.py album <albumMid> --quality best --spatial
+
 # 下载整个歌单
 python3 qq_dl.py playlist <歌单ID> --quality 320
 
@@ -57,11 +60,32 @@ python3 qq_dl.py --login --login-type wx  # 微信扫码
 | `128` | 标准 MP3 128kbps |
 | `320` | HQ MP3 320kbps（需会员）|
 | `flac` | FLAC 无损（需会员）|
+| `master` | 臻品母带 FLAC，24 bit / 192 kHz（需超级会员；算法加工版，见下）|
 | `ape` | APE 无损（需会员）|
 | `m4a` | 默认 M4A |
 | `best` | 无损优先，这首没有无损就退到 320，再没有就 128 |
 
+臻品母带不是录音室母带，`best` 不会选它。按 QQ 音乐的官方介绍，它是用神经网络算法在普通音源上修复、补出高频后提升到 24 bit / 192 kHz 的。实测和这一点一致：降回无损的采样率后，8 kHz 以下和无损逐采样几乎一样，往上越来越不一样，20 kHz 以上的内容全是新加的。QQ 没有无损的歌，它的臻品母带和那首 320k MP3 吻合得比真无损和 MP3 之间还紧，说明就是从 MP3 算出来的。文件约是无损的 3 倍大。
+
 不指定 `--quality` 时默认 `320`。会员无权限的歌会打印提示并跳过，可降级到 `128` 重试。指定的音质这首歌没有时也会跳过，不会拿别的音质顶替。默认下载到 `~/Music/QQMusic`，用 `--output-dir` 改。
+
+### 全景声版（`--spatial`）
+
+QQ 音乐有两种「全景声」：
+
+- **杜比全景声**：唱片公司交付的单独混音。时长、响度、动态都和立体声不同，按杜比规范做在 -18 LUFS 左右。
+- **臻品全景声**：QQ 从立体声成品算出来的。采样数和立体声一个不差，响度也照搬立体声。官方说法是 AI 自动渲染。
+
+QQ 一般只在拿不到杜比版时才提供臻品全景声。
+
+`album ... --spatial` 先照常下立体声版。专辑里只要有一首杜比全景声，就再存一份完整的全景声版到 `专辑名（全景声）/`：
+
+- 每首按 杜比全景声（768k → 640k → 448k）→ 臻品全景声 5.1 FLAC → 立体声 取第一个有的，保证这一版也是整张专辑。
+- 杜比版存成 `.m4a`（E-AC-3 JOC）。
+- 标签多写 `ALBUMVERSION=全景声` 和 `RELEASEDATE`。Navidrome 会把它当成同名专辑的另一个版本，不会和立体声版混在一起。
+- 杜比版和臻品全景声响度差约 10 dB，所以每首都写了 ReplayGain（参考 -18 LUFS）。
+
+专辑里一首杜比全景声都没有时，不存全景声版。
 
 ### 文件夹结构
 
