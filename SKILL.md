@@ -103,6 +103,18 @@ python3 ~/.claude/skills/music-dl/qq_dl.py search "晴天" --first --quality fla
 
 失败时打印 `❌ ...`，并且**不会留下正式文件**（临时的 `.part` 文件会被删掉），所以"已存在就跳过"跳过的一定是校验过的完整文件。看到 `❌` 就把原因转告用户，不要当成功。
 
+### 歌词时间轴（需要 Gemini API key）
+
+有 key（环境变量 `GEMINI_API_KEY` 或钥匙串 `gemini-api-key`）时，下载会自动给只有纯文本的歌词补上逐行时间，成功时打印 `🎤 Gemini 对出 N 行时间轴`。用户不想要时加 `--no-ai-lyrics`；用户要给没有歌词的歌听写歌词时加 `--transcribe-lyrics`。
+
+给已有的本地文件补时间轴（不需要登录 QQ）：
+
+```bash
+python3 /Users/gpo/.claude/skills/music-dl/qq_dl.py lyrics ~/Music/QQMusic/专辑名 --transcribe-lyrics
+```
+
+没有 key 时这一步自动跳过；不要替用户找或填 key，让用户自己用 `security add-generic-password -a "$USER" -s gemini-api-key -U -w` 存。
+
 ## 元数据与完整性校验
 
 每首歌都按这个顺序处理，任何一步不过关都不会生成正式文件：

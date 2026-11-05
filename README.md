@@ -96,6 +96,18 @@ QQ 一般只在拿不到杜比版时才提供臻品全景声。
 - 专辑没下全时不写专辑增益，补下完再跑一次就会写。整张都已存在、这次什么都没下时不动文件。
 - 只改这几个标签：在副本上写，回读一致再替换原文件。
 
+### 歌词时间轴（Gemini）
+
+有些歌在 QQ 上只有纯文本歌词，没有时间轴，播放器没法跟着滚动。设置了 Gemini API key 时，下载会自动把整首歌（转成 128k MP3）和歌词一起交给 Gemini 4 Argon，对出每句开唱的时间，再写进文件。
+
+- key 从环境变量 `GEMINI_API_KEY` 读；macOS 上也可以存进钥匙串：`security add-generic-password -a "$USER" -s gemini-api-key -U -w`
+- 已经有时间轴的歌词不动。`--no-ai-lyrics` 关掉这一步。
+- `--transcribe-lyrics`：没有歌词的歌也让 Gemini 从零听写。
+- 返回的歌词行必须和原文一字不差、时间单调递增、不超过歌曲长度，否则重试一次后放弃，保留原来的纯文本。
+- 给已经下载好的文件补：`python3 qq_dl.py lyrics <文件或文件夹> [--transcribe-lyrics]`。不需要登录 QQ，只改歌词标签。
+
+音频必须放在请求的用户消息里。2026-11 实测：同一个模型，音频放在工具调用的返回结果里（Antigravity 的 read_file 就是这样）时，时间会整体漂移几秒到几十秒；放在用户消息里，和人工时间轴的中位误差约 0.2 秒。本地强制对齐（Qwen3-ForcedAligner）要求歌词和唱的完全一致，纯文本歌词常漏写重复段，效果不如 Gemini。
+
 ### 文件夹结构
 
 `--layout flat`（`search` / `song` / `playlist` 的默认）存成 `歌手 - 歌名.flac`；`--layout album`（`album` 的默认）存成 `专辑名/01 歌名.flac`，多碟专辑是 `1-01 歌名.flac`。
