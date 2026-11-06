@@ -82,6 +82,10 @@ SPATIAL_MAP = {
 }
 SPATIAL_DOLBY = ["dolby768", "dolby640", "dolby448"]
 SPATIAL_VERSION = "全景声"  # 写进 ALBUMVERSION，Navidrome 据此把它当成同名专辑的另一个版本
+# 纯文本歌词的时间轴：Gemini 听整首歌对出每句开唱的时间。只有设了 API key 才启用。
+# 音频必须放在用户消息里：放进工具调用的返回结果（Antigravity 的 read_file 就是这样）时间会整体漂几秒到几十秒
+GEMINI_MODEL = "gemini-4-argon"
+AI_LYRICS = {"enabled": True, "transcribe": False}
 REPLAYGAIN_REFERENCE = -18.0  # LUFS；杜比版按规范做在 -18 左右，臻品全景声跟立体声一样在 -9 左右，混在一张专辑里要靠它拉平
 
 
@@ -1330,6 +1334,194 @@ def _extra_tags(meta: dict) -> dict:
     return extra
 
 
+# ─── AI 歌词时间轴 ───────────────────────────────────────────────────────
+
+_gemini_key_cache: list = []
+
+
+def gemini_key() -> str | None:
+    """环境变量 GEMINI_API_KEY，或 macOS 钥匙串里名为 gemini-api-key 的条目。都没有返回 None"""
+    if not _gemini_key_cache:
+        key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not key and shutil.which("security"):
+            r = subprocess.run(["security", "find-generic-password", "-s", "gemini-api-key", "-w"],
+                               capture_output=True, text=True)
+            key = r.stdout.strip() if r.returncode == 0 else ""
+        _gemini_key_cache.append(key or None)
+    return _gemini_key_cache[0]
+
+
+_LRC_TIME = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]")
+
+
+def lyrics_timed(text: str) -> bool:
+    """一半以上的歌词行带 [mm:ss] 就算已经有时间轴"""
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not re.match(r"^\[[a-z]+:", l.strip())]
+    return bool(lines) and sum(1 for l in lines if _LRC_TIME.match(l)) * 2 >= len(lines)
+
+
+_ALIGN_PROMPT = """完整听一遍这段音频。下面是这首歌的歌词，每行一句，顺序就是演唱顺序：
+
+<lyrics>
+{lyrics}
+</lyrics>
+
+任务：给每一行歌词标上这一句人声开始唱出的时间，输出 LRC。
+要求：
+- 时间格式 [mm:ss.xx]（精确到百分之一秒），时间是这一句第一个字发声的时刻，不是前奏或上一句结尾。
+- 每行歌词原样保留、一行不多一行不少、顺序不变；时间必须单调递增。
+- 第一行如果是「歌名 - 歌手」这种标题行，或者是作词作曲之类的署名行，时间写 [00:00.00]。
+- 只输出 LRC 正文，不要任何解释、代码块标记或别的文字。"""
+
+_TRANSCRIBE_PROMPT = """完整听一遍这段音频，听写出全部人声歌词，并给每一句标上开始唱的时间，输出 LRC。
+要求：
+- 时间格式 [mm:ss.xx]，是这一句第一个字发声的时刻；时间单调递增。
+- 按自然乐句断行，一行一句；重复的段落也要按实际演唱次数写全。
+- 听不清的词按最可能的写，不要写「听不清」之类的说明；纯音乐段不写。
+- 只输出 LRC 正文，不要任何解释、代码块标记或别的文字。"""
+
+
+def ai_time_lyrics(path: Path, plain: str, duration: float) -> tuple[str | None, str]:
+    """
+    plain 非空：给这份纯文本歌词对时间；为空：从零听写。
+    返回 (LRC 或 None, 说明)。歌词行必须和原文一字不差、时间单调递增、不超过歌曲时长，否则重试一次后放弃
+    """
+    key = gemini_key()
+    if not key:
+        return None, "没有 Gemini API key"
+    if not shutil.which("ffmpeg"):
+        return None, "没装 ffmpeg"
+    # 转成 128k MP3 再传：无损文件太大，请求体有上限
+    tmp = path.with_name(f"{path.stem}.ai-lyrics.mp3")
+    try:
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path), "-map", "0:a:0", "-ac", "2",
+                        "-b:a", "128k", str(tmp)], check=True)
+        audio = base64.b64encode(tmp.read_bytes()).decode()
+    except Exception as e:
+        return None, f"转码失败: {e}"
+    finally:
+        tmp.unlink(missing_ok=True)
+    want = [l.strip() for l in plain.splitlines() if l.strip()]
+    prompt = _ALIGN_PROMPT.format(lyrics="\n".join(want)) if want else _TRANSCRIBE_PROMPT
+    body = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "audio/mpeg", "data": audio}},
+                                                    {"text": prompt}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "medium"}}}
+    problem = ""
+    for _ in (1, 2):
+        try:
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                              headers={"x-goog-api-key": key}, json=body, timeout=600)
+            if r.status_code != 200:
+                problem = f"Gemini 返回 HTTP {r.status_code}"
+                continue
+            parts = r.json()["candidates"][0]["content"].get("parts", [])
+        except Exception as e:
+            problem = f"请求 Gemini 失败: {e}"
+            continue
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        lines = [l.strip() for l in text.strip().strip("`").splitlines() if l.strip()]
+        stamps = [_LRC_TIME.match(l) for l in lines]
+        if not lines or not all(stamps):
+            problem = "返回的不是 LRC"
+            continue
+        secs = [int(m[1]) * 60 + float(m[2]) for m in stamps]
+        if any(b < a for a, b in zip(secs, secs[1:])):
+            problem = "时间不是单调递增"
+            continue
+        if duration and secs[-1] > duration + 1:
+            problem = "时间超出了歌曲长度"
+            continue
+        if want and [_LRC_TIME.sub("", l).strip() for l in lines] != want:
+            problem = "返回的歌词行和原文对不上"
+            continue
+        return "\n".join(lines), (f"Gemini 对出 {len(lines)} 行时间轴" if want else f"Gemini 听写出 {len(lines)} 行")
+    return None, problem
+
+
+def _maybe_time_lyrics(path: Path, meta: dict) -> dict:
+    """下载流程里用：纯文本歌词补时间轴；没歌词且开了 --transcribe-lyrics 就听写。失败保留原歌词"""
+    lyr = meta.get("lyrics") or ""
+    if not AI_LYRICS["enabled"] or not gemini_key() or lyrics_timed(lyr):
+        return meta
+    if not lyr and not AI_LYRICS["transcribe"]:
+        return meta
+    timed, how = ai_time_lyrics(path, lyr, float(meta.get("duration") or 0))
+    if timed:
+        print(f"  🎤 {how}")
+        return {**meta, "lyrics": timed}
+    print(f"  ⚠️ 歌词时间轴没做成（{how}），{'保留纯文本歌词' if lyr else '不写歌词'}")
+    return meta
+
+
+def _read_lyrics(path: Path) -> str:
+    import mutagen
+    tags = mutagen.File(path).tags or {}
+    ext = path.suffix.lower()
+    if ext == ".mp3":
+        uslt = tags.getall("USLT")
+        return uslt[0].text if uslt else ""
+    for k in ("LYRICS", "lyrics", "UNSYNCEDLYRICS", "\xa9lyr", "Lyrics"):
+        if k in tags:
+            v = tags[k]
+            v = v[0] if isinstance(v, list) else v
+            return str(v)
+    return ""
+
+
+def _write_lyrics(path: Path, text: str):
+    """只改歌词这一个标签"""
+    ext = path.suffix.lower()
+    if ext == ".flac":
+        from mutagen.flac import FLAC
+        audio = FLAC(path); audio["LYRICS"] = text; audio.save()
+    elif ext == ".mp3":
+        from mutagen.id3 import ID3, USLT, Encoding
+        tags = ID3(path)
+        tags.setall("USLT", [USLT(encoding=Encoding.UTF16, lang="XXX", desc="", text=text)])
+        tags.save(path, v1=0, v2_version=3, v23_sep=None)
+    elif ext == ".m4a":
+        from mutagen.mp4 import MP4
+        audio = MP4(path); audio["\xa9lyr"] = [text]; audio.save()
+    elif ext == ".ape":
+        from mutagen.apev2 import APEv2
+        tags = APEv2(path); tags["Lyrics"] = text; tags.save(path)
+
+
+def time_lyrics_in_files(target: Path, transcribe: bool) -> list[str]:
+    """lyrics 命令：给已下载的文件（或整个文件夹）补歌词时间轴。只改歌词标签，改完回读确认"""
+    import mutagen
+    files = sorted(p for p in ([target] if target.is_file() else target.rglob("*"))
+                   if p.suffix.lower() in (".flac", ".mp3", ".m4a", ".ape") and ".part" not in p.name)
+    results = []
+    for i, path in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] {path.name}")
+        lyr = _read_lyrics(path)
+        if lyrics_timed(lyr):
+            print("  ⏭️  已经有时间轴")
+            results.append("skip"); continue
+        if not lyr and not transcribe:
+            print("  ⏭️  没有歌词（加 --transcribe-lyrics 让 Gemini 从零听写）")
+            results.append("skip"); continue
+        timed, how = ai_time_lyrics(path, lyr, mutagen.File(path).info.length)
+        if not timed:
+            print(f"  ❌ {how}")
+            results.append("fail"); continue
+        part = path.with_name(f"{path.stem}.part{path.suffix}")
+        shutil.copy2(path, part)  # 在副本上改，回读一致再换回去
+        try:
+            _write_lyrics(part, timed)
+            if _read_lyrics(part).strip() != timed.strip():
+                raise ValueError("歌词回读不一致")
+        except Exception as e:
+            part.unlink(missing_ok=True)
+            print(f"  ❌ 写歌词失败: {e}")
+            results.append("fail"); continue
+        part.replace(path)
+        print(f"  🎤 {how}，已写入")
+        results.append("ok")
+    return results
+
+
 def measure_replaygain(path: Path) -> tuple[float, float] | None:
     """用 ffmpeg 的 EBU R128 量整首响度，换算成 ReplayGain 2.0 的增益和采样峰值。没装 ffmpeg 返回 None"""
     if not shutil.which("ffmpeg"):
@@ -1831,6 +2023,7 @@ def _save_track(api: QQMusicAPI, url: str, output_path: Path, meta: dict) -> str
     how = ""
     try:
         meta = {**meta, "replaygain": measure_replaygain(part_path)}
+        meta = _maybe_time_lyrics(part_path, meta)
         embed_metadata(part_path, ext, meta, cover)
         problems = verify_tags(part_path, ext, meta, cover)
         after, how = check_audio(part_path, meta)  # 写标签后再验一次，确认没把音频写坏
@@ -1956,7 +2149,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="QQ音乐下载器 - 支持扫码登录 + 会员音质")
-    parser.add_argument("command", nargs="?", default="", help="命令: search/搜索, song/歌曲, album/专辑, playlist/歌单")
+    parser.add_argument("command", nargs="?", default="", help="命令: search/搜索, song/歌曲, album/专辑, playlist/歌单, lyrics/歌词（给本地文件补歌词时间轴）")
     parser.add_argument("query", nargs="?", default="", help="搜索关键词 / songMid / albumMid 或专辑关键词 / 歌单ID")
     parser.add_argument("--quality", "-q", default="320", choices=list(QUALITY_MAP.keys()) + ["best"],
                         help="音质 (128/320/flac/master/ape/m4a；best = 无损优先，没有就退到 320 / 128)")
@@ -1969,10 +2162,28 @@ def main():
     parser.add_argument("--index", "-i", type=int, default=None, help="仅下载 search 结果中的第 N 条 (1-based)，用于非交互调用")
     parser.add_argument("--first", action="store_true", help="仅下载 search 结果中的第 1 条，等价于 --index 1")
     parser.add_argument("--output-dir", "-o", type=str, default=None, help="下载输出目录，默认 ~/Music/QQMusic")
+    parser.add_argument("--no-ai-lyrics", action="store_true",
+                        help="不用 Gemini 给纯文本歌词补时间轴（默认有 API key 就补）")
+    parser.add_argument("--transcribe-lyrics", action="store_true",
+                        help="没有歌词的歌，让 Gemini 从零听写歌词（需要 API key）")
     parser.add_argument("--spatial", action="store_true",
                         help="album 专用：专辑里有杜比全景声时，另存一份完整的全景声版到「专辑名（全景声）/」")
 
     args = parser.parse_args()
+    AI_LYRICS["enabled"] = not args.no_ai_lyrics
+    AI_LYRICS["transcribe"] = args.transcribe_lyrics
+
+    if args.command in ("lyrics", "歌词", "ly"):
+        # 只处理本地文件，不需要登录 QQ
+        if not args.query:
+            print("❌ 请提供音频文件或文件夹路径")
+            sys.exit(1)
+        if not gemini_key():
+            print("❌ 没有 Gemini API key：设环境变量 GEMINI_API_KEY，或存进钥匙串（security add-generic-password -a \"$USER\" -s gemini-api-key -U -w）")
+            sys.exit(1)
+        results = time_lyrics_in_files(Path(args.query).expanduser(), args.transcribe_lyrics)
+        print(f"\n🎤 ✅ 补上 {results.count('ok')} 首 · ⏭️ 跳过 {results.count('skip')} 首 · ❌ 失败 {results.count('fail')} 首")
+        sys.exit(2 if "fail" in results else 0)
 
     if args.output_dir:
         global DOWNLOAD_DIR
