@@ -803,7 +803,7 @@ class QQMusicAPI:
         for item in items:
             song = {
                 "mid": item.get("mid", ""),
-                "name": item.get("name", "").replace("\u00a0", " "),
+                "name": (item.get("title") or item.get("name") or "").replace("\u00a0", " "),
                 "singer": ", ".join(s.get("name", "") for s in item.get("singer", [])),
                 "album": item.get("album", {}).get("name", ""),
                 "album_mid": item.get("album", {}).get("mid", ""),
@@ -833,7 +833,7 @@ class QQMusicAPI:
             album = item.get("album") or {}
             songs.append({
                 "mid": item.get("mid", ""),
-                "name": item.get("name", ""),
+                "name": (item.get("title") or item.get("name") or "").replace("\u00a0", " "),
                 "singer": ", ".join(s.get("name", "") for s in item.get("singer", [])),
                 "album": album.get("name", ""),
                 "album_mid": album.get("mid", ""),
@@ -984,7 +984,7 @@ class QQMusicAPI:
         album = ti.get("album") or {}
         meta = {
             "mid": ti["mid"],
-            "title": (ti.get("name") or ti.get("title") or "").replace(" ", " "),
+            "title": (ti.get("title") or ti.get("name") or "").replace(" ", " "),
             "artists": [s["name"] for s in singers if s.get("name")],
             "singer_mids": [s["mid"] for s in singers if s.get("mid")],
             "album": album.get("name", ""),
@@ -1011,8 +1011,10 @@ class QQMusicAPI:
             tracks = alb.get("tracks", [])
             mine = next((t for t in tracks if t["mid"] == meta["mid"]), None)
             if mine:
-                same_disc = sorted(t["index"] for t in tracks if t["cd"] == mine["cd"])
-                meta["track"] = same_disc.index(mine["index"]) + 1
+                same_disc = [t for t in tracks if t["cd"] == mine["cd"]]
+                if all(t["index"] > 0 for t in same_disc):
+                    same_disc.sort(key=lambda t: t["index"])
+                meta["track"] = next(i for i, t in enumerate(same_disc, 1) if t["mid"] == meta["mid"])
                 meta["track_total"] = len(same_disc)
                 meta["disc"] = mine["cd"] + 1
                 meta["disc_total"] = max(t["cd"] for t in tracks) + 1
@@ -1059,7 +1061,7 @@ class QQMusicAPI:
                 items += more
             result["tracks"] = [
                 {"mid": si["mid"], "cd": si.get("index_cd") or 0, "index": si.get("index_album") or 0,
-                 "name": (si.get("name") or si.get("title") or "").replace(" ", " "),
+                 "name": (si.get("title") or si.get("name") or "").replace(" ", " "),
                  "singer": ", ".join(s.get("name", "") for s in si.get("singer") or []),
                  "duration": si.get("interval", 0)}
                 for si in (it.get("songInfo") or {} for it in items) if si.get("mid")
